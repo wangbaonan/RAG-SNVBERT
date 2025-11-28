@@ -1,0 +1,1 @@
+python build_ref_db_intersect.py --ref_vcf /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/data/KGP_train_520_42_chr21.vcf.gz --ref_panel /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/data/traindata_520_42_KGP_info_new.txt --window_csv /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/segments_V1.4.csv --output_dir ref_data_intersect/

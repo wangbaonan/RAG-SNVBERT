@@ -1,0 +1,1 @@
+python test_faiss.py --target_vcf /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/masked_vcfs/KGP_chr21_masked_40.vcf --ref_db ref_data/ --window_csv /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/data/segments_V1.2.csv --top_k 5
