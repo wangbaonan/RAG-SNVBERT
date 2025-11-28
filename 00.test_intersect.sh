@@ -1,0 +1,1 @@
+python test_faiss_intersect.py --target_vcf /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/masked_vcfs/KGP_chr21_masked_40.vcf --ref_db ref_data_intersect/ --window_csv /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/segments_V1.4.csv --top_k 5 --distance_mode l2 --sample_idx -1
