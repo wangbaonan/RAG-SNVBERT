@@ -4,10 +4,10 @@
 
 import argparse
 import torch
-import pickle
 from torch.utils.data import DataLoader
 
 from .dataset.rag_train_dataset import RAGTrainDataset, rag_collate_fn_with_dataset
+from .dataset import PanelData, WordVocab
 from .model.bert import BERTWithRAG
 from .model.foundation_model import BERTFoundationModel
 from .main.pretrain_with_val_enhanced import BERTTrainerWithValidationEnhanced
@@ -73,24 +73,32 @@ def main():
         print(f"Metrics CSV: {args.metrics_csv}")
     print(f"{'='*60}\n")
 
-    # 加载vocab
-    with open(args.type_path, 'rb') as f:
-        vocab = pickle.load(f)
-
+    # 加载panel和vocab
     print(f"{'='*60}")
     print(f"Loading Data...")
     print(f"{'='*60}")
 
+    # 加载panel
+    panel = PanelData.from_file(args.train_panel)
+    print("✓ Panel loaded")
+
+    # 初始化词表
+    print("Initializing Vocab...")
+    vocab = WordVocab(list(panel.pop_class_dict.keys()))
+    print(f"✓ Vocab size: {len(vocab)}")
+
     # 加载训练数据
-    print("Loading Training Dataset...")
+    print("\nLoading Training Dataset...")
     rag_train_loader = RAGTrainDataset.from_file(
-        h5_path=args.train_dataset,
-        panel_path=args.train_panel,
-        ref_vcf_path=args.refpanel_path,
-        freq_path=args.freq_path,
-        window_path=args.window_path,
-        pos_dict_path=args.pos_path,
-        pop_dict_path=args.pop_path,
+        vocab,
+        args.train_dataset,
+        args.train_panel,
+        args.freq_path,
+        args.window_path,
+        args.type_path,
+        args.pop_path,
+        args.pos_path,
+        args.refpanel_path,
         build_ref_data=True,
         n_gpu=1
     )
@@ -113,13 +121,15 @@ def main():
     if args.val_dataset and args.val_panel:
         print("\nLoading Validation Dataset...")
         rag_val_loader = RAGTrainDataset.from_file(
-            h5_path=args.val_dataset,
-            panel_path=args.val_panel,
-            ref_vcf_path=args.refpanel_path,
-            freq_path=args.freq_path,
-            window_path=args.window_path,
-            pos_dict_path=args.pos_path,
-            pop_dict_path=args.pop_path,
+            vocab,
+            args.val_dataset,
+            args.val_panel,
+            args.freq_path,
+            args.window_path,
+            args.type_path,
+            args.pop_path,
+            args.pos_path,
+            args.refpanel_path,
             build_ref_data=True,
             n_gpu=1
         )
