@@ -76,11 +76,28 @@ class RAGTrainDataset(TrainDataset):
             # =========================
 
             ref_start = time.time()
-            # 获取参考数据索引 
+            # 获取参考数据索引
             # train_pos是训练数据中从vcf提取的窗口内的物理位置变量
             train_pos = self.pos[current_slice]
             # ref_indices 列表，存储 train_pos 中每个元素在 ref_pos 中的索引
-            ref_indices = [np.where(ref_pos == p)[0][0] for p in train_pos]
+            # 修复：处理验证集和训练集SNP位点不完全匹配的情况
+            ref_indices = []
+            valid_pos_mask = []
+            for idx, p in enumerate(train_pos):
+                matches = np.where(ref_pos == p)[0]
+                if len(matches) > 0:
+                    ref_indices.append(matches[0])
+                    valid_pos_mask.append(idx)
+
+            # 如果有位点在参考面板中找不到，需要过滤
+            if len(ref_indices) < len(train_pos):
+                print(f"  ⚠ 警告：窗口 {len(self.ref_data_windows)} 中有 {len(train_pos) - len(ref_indices)}/{len(train_pos)} 个位点在参考面板中不存在，已跳过")
+                # 更新current_slice只包含有效位点
+                valid_indices = start + np.array(valid_pos_mask)
+                if len(valid_indices) == 0:
+                    print(f"  ⚠ 跳过窗口 {len(self.ref_data_windows)}：没有可用的位点")
+                    continue
+                current_slice = valid_indices
             #print("ref_indices")
             #print(ref_indices)
             #print("ref_gt.shape:")
