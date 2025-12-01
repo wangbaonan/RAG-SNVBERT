@@ -91,13 +91,16 @@ class RAGTrainDataset(TrainDataset):
 
             # 如果有位点在参考面板中找不到，需要过滤
             if len(ref_indices) < len(train_pos):
-                print(f"  ⚠ 警告：窗口 {len(self.ref_data_windows)} 中有 {len(train_pos) - len(ref_indices)}/{len(train_pos)} 个位点在参考面板中不存在，已跳过")
-                # 更新current_slice只包含有效位点
-                valid_indices = start + np.array(valid_pos_mask)
-                if len(valid_indices) == 0:
-                    print(f"  ⚠ 跳过窗口 {len(self.ref_data_windows)}：没有可用的位点")
+                print(f"  ⚠ 警告：窗口 {w_idx} 中有 {len(train_pos) - len(ref_indices)}/{len(train_pos)} 个位点在参考面板中不存在，已跳过")
+                # 如果有效位点数量太少，跳过整个窗口
+                if len(valid_pos_mask) == 0:
+                    print(f"  ⚠ 跳过窗口 {w_idx}：没有可用的位点")
                     continue
+                # 更新current_slice只包含有效位点
+                valid_indices = current_slice.start + np.array(valid_pos_mask)
                 current_slice = valid_indices
+                # 同时更新train_pos只包含有效位点
+                train_pos = train_pos[valid_pos_mask]
             #print("ref_indices")
             #print(ref_indices)
             #print("ref_gt.shape:")
