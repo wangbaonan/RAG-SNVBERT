@@ -39,14 +39,24 @@ def split_h5_by_samples(input_h5, output_dir, val_ratio=0.15, random_seed=42):
     with h5py.File(input_h5, 'r') as f:
         gt_data = f['calldata/GT'][:]  # (n_variants, n_samples, 2)
 
-        # 尝试读取其他元数据
+        # 读取variants组（包含POS等）
         metadata = {}
+        if 'variants' in f:
+            for key in f['variants'].keys():
+                try:
+                    metadata[f'variants/{key}'] = f[f'variants/{key}'][:]
+                    print(f"  - Read variants/{key}: shape={f[f'variants/{key}'].shape}")
+                except Exception as e:
+                    print(f"  - Warning: Could not read variants/{key}: {e}")
+
+        # 读取其他顶层组
         for key in f.keys():
-            if key != 'calldata':
+            if key not in ['calldata', 'variants']:
                 try:
                     metadata[key] = f[key][:]
-                except:
-                    pass
+                    print(f"  - Read {key}")
+                except Exception as e:
+                    print(f"  - Warning: Could not read {key}: {e}")
 
         # 读取calldata下的其他数据
         if 'calldata' in f:
@@ -54,8 +64,9 @@ def split_h5_by_samples(input_h5, output_dir, val_ratio=0.15, random_seed=42):
                 if key != 'GT':
                     try:
                         metadata[f'calldata/{key}'] = f[f'calldata/{key}'][:]
-                    except:
-                        pass
+                        print(f"  - Read calldata/{key}")
+                    except Exception as e:
+                        print(f"  - Warning: Could not read calldata/{key}: {e}")
 
     n_variants, n_samples, n_ploidy = gt_data.shape
     print(f"✓ Data loaded:")
