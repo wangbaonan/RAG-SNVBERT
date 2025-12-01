@@ -156,15 +156,22 @@ def split_panel(input_panel, output_dir, train_indices, val_indices):
     with open(input_panel, 'r') as f:
         lines = f.readlines()
 
-    # 第一行可能是header
-    has_header = not lines[0].split()[0].startswith('sample') and not lines[0][0].isdigit()
+    # 检测第一行是否是header
+    # Header通常包含 'sample', 'pop', 'super_pop' 等关键词
+    first_line_lower = lines[0].lower().strip()
+    has_header = ('sample' in first_line_lower or
+                  'pop' in first_line_lower or
+                  'super_pop' in first_line_lower or
+                  lines[0].startswith('#'))
 
     if has_header:
         header = lines[0]
         samples = lines[1:]
+        print(f"  - Detected header: {header.strip()}")
     else:
         header = None
         samples = lines
+        print(f"  - No header detected")
 
     print(f"  - Total samples in panel: {len(samples)}")
 
