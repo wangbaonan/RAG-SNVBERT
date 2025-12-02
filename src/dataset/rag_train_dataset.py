@@ -20,12 +20,14 @@ INFER_WINDOW_LEN = 1020
 MAX_SEQ_LEN = 1030
 
 class RAGTrainDataset(TrainDataset):
-    def __init__(self, vocab, vcf, pos, panel, freq, window, 
-                 type_to_idx, pop_to_idx, pos_to_idx, 
-                 ref_vcf_path=None, build_ref_data=True, n_gpu=1,maf_mask_percentage=10):
-        super().__init__(vocab, vcf, pos, panel, freq, window, 
+    def __init__(self, vocab, vcf, pos, panel, freq, window,
+                 type_to_idx, pop_to_idx, pos_to_idx,
+                 ref_vcf_path=None, build_ref_data=True, n_gpu=1, maf_mask_percentage=10,
+                 use_dynamic_mask=False):
+        super().__init__(vocab, vcf, pos, panel, freq, window,
                         type_to_idx, pop_to_idx, pos_to_idx)
         self.maf_mask_percentage = maf_mask_percentage
+        self.use_dynamic_mask = use_dynamic_mask  # 新增: 控制是否动态生成mask
         self.ref_data_windows = []    # [num_windows, num_positions, sample * hap]  所有窗口上的ref_data
         self.raw_ref_data_windows = []
         self.window_indexes = [] # 每个窗口的FAISS索引
@@ -159,7 +161,17 @@ class RAGTrainDataset(TrainDataset):
     def __getitem__(self, item) -> dict:
         output = super().__getitem__(item)
         window_idx = item % self.window_count
-        current_mask = self.window_masks[window_idx]
+
+        # 修复: 根据配置选择静态或动态mask
+        if self.use_dynamic_mask:
+            # 动态生成mask (用于validation,避免每个epoch完全相同)
+            window_len = self.window.window_info[window_idx, 1] - self.window.window_info[window_idx, 0]
+            raw_mask = self.generate_mask(window_len)
+            current_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
+        else:
+            # 使用预生成的mask (用于training,保持一致性)
+            current_mask = self.window_masks[window_idx]
+
         output['mask'] = current_mask
         output['hap_1'] = self.tokenize(output['hap1_nomask'], current_mask)
         output['hap_2'] = self.tokenize(output['hap2_nomask'], current_mask)
@@ -182,7 +194,8 @@ class RAGTrainDataset(TrainDataset):
                   pospath,
                   ref_vcf_path=None,
                   build_ref_data=True,
-                  n_gpu=1):
+                  n_gpu=1,
+                  use_dynamic_mask=False):
         # 调用父类的 from_file 方法创建基础的 TrainDataset 实例
         base_dataset = super().from_file(vocab, vcfpath, panelpath, freqpath, windowpath, typepath, poppath, pospath)
 
@@ -199,7 +212,8 @@ class RAGTrainDataset(TrainDataset):
             pos_to_idx=base_dataset.pos_to_idx,
             ref_vcf_path=ref_vcf_path,
             build_ref_data=build_ref_data,
-            n_gpu=n_gpu
+            n_gpu=n_gpu,
+            use_dynamic_mask=use_dynamic_mask
         )
         return rag_dataset
 

@@ -295,7 +295,7 @@ class BERTTrainerWithValidationOptimized():
                 self._print_log(epoch, i, eval_dict, data_iter, train=True)
 
         # Epoch结束,打印完整总结
-        self._print_epoch_summary(epoch, eval_dict, len(dataloader), train=train)
+        self._print_epoch_summary(epoch, eval_dict, len(dataloader), dataloader.batch_size, train=train)
 
         # 保存epoch指标到CSV (新增)
         self._save_epoch_metrics(epoch, eval_dict, len(dataloader), train=train)
@@ -329,7 +329,7 @@ class BERTTrainerWithValidationOptimized():
 
         data_iter.write(pprint.pformat(log_dict))
 
-    def _print_epoch_summary(self, epoch, eval_dict, num_batches, train=True):
+    def _print_epoch_summary(self, epoch, eval_dict, num_batches, batch_size, train=True):
         """打印Epoch总结 (增强版)"""
         # Overall metrics
         hap_precision, hap_recall, hap_f1 = self.calculate_metrics(
@@ -362,7 +362,10 @@ class BERTTrainerWithValidationOptimized():
         print(f"\n{'='*60}")
         print(f"Epoch {epoch+1} {mode} Summary")
         print(f"{'='*60}")
-        print(f"Avg Loss:      {eval_dict['hap_loss'] / num_batches:.4f}")
+
+        # 修复: 按样本数归一化,而不是batch数
+        total_samples = num_batches * batch_size
+        print(f"Avg Loss:      {eval_dict['hap_loss'] / total_samples:.4f}")
         print(f"Avg Accuracy:  {eval_dict['hap_correct'] / eval_dict['hap_numbers']:.4f}")
 
         print(f"\nHaplotype Metrics (Overall):")

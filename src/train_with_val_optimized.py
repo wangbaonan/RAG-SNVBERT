@@ -149,7 +149,8 @@ def main():
             args.pos_path,
             args.refpanel_path,
             build_ref_data=True,
-            n_gpu=1
+            n_gpu=1,
+            use_dynamic_mask=True  # 修复: 验证集使用动态mask
         )
 
         val_dataloader = DataLoader(
