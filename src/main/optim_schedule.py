@@ -11,12 +11,13 @@ from sklearn.metrics import r2_score
 class ScheduledOptim():
     '''A simple wrapper class for learning rate scheduling'''
 
-    def __init__(self, optimizer, n_warmup_steps):
+    def __init__(self, optimizer, n_warmup_steps, init_lr=1e-5, max_lr=5e-5):
         self._optimizer = optimizer
         self.n_warmup_steps = n_warmup_steps
         self.n_current_steps = 0
-        self.init_lr = 1e-4
-        self.max_lr = 1.5e-4
+        # 修复: 使用传入的学习率参数,而不是硬编码
+        self.init_lr = init_lr
+        self.max_lr = max_lr
 
     # def step_and_update_lr(self):
     #     "Step with the inner optimizer"

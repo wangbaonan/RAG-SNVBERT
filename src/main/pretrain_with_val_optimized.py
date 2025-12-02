@@ -72,7 +72,9 @@ class BERTTrainerWithValidationOptimized():
 
         self.optim = Adam(self.model.parameters(), lr=lr, betas=betas,
                         weight_decay=weight_decay, fused=True)
-        self.optim_schedule = ScheduledOptim(self.optim, n_warmup_steps=warmup_steps)
+        # 修复: 传递学习率参数到scheduler
+        self.optim_schedule = ScheduledOptim(self.optim, n_warmup_steps=warmup_steps,
+                                            init_lr=lr*0.2, max_lr=lr)
 
         self.scaler = GradScaler(enabled=with_cuda)
         self.grad_accum_steps = grad_accum_steps

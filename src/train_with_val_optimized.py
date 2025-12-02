@@ -214,6 +214,12 @@ def main():
     print(f"{'='*60}\n")
 
     for epoch in range(args.epochs):
+        # 更新epoch计数器(用于动态mask随机种子)
+        if rag_train_loader:
+            rag_train_loader.current_epoch = epoch
+        if rag_val_loader:
+            rag_val_loader.current_epoch = epoch
+
         # 训练
         train_metrics = trainer.train(epoch)
 

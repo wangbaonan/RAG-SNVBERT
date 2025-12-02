@@ -28,6 +28,7 @@ class RAGTrainDataset(TrainDataset):
                         type_to_idx, pop_to_idx, pos_to_idx)
         self.maf_mask_percentage = maf_mask_percentage
         self.use_dynamic_mask = use_dynamic_mask  # 新增: 控制是否动态生成mask
+        self.current_epoch = 0  # 新增: 跟踪当前epoch,用于动态mask随机种子
         self.ref_data_windows = []    # [num_windows, num_positions, sample * hap]  所有窗口上的ref_data
         self.raw_ref_data_windows = []
         self.window_indexes = [] # 每个窗口的FAISS索引
@@ -165,9 +166,18 @@ class RAGTrainDataset(TrainDataset):
         # 修复: 根据配置选择静态或动态mask
         if self.use_dynamic_mask:
             # 动态生成mask (用于validation,避免每个epoch完全相同)
+            # 使用epoch和window_idx作为随机种子,确保每个epoch mask不同
             window_len = self.window.window_info[window_idx, 1] - self.window.window_info[window_idx, 0]
+
+            # 临时设置随机种子(基于epoch和window_idx)
+            old_state = np.random.get_state()
+            np.random.seed(self.current_epoch * 10000 + window_idx)
+
             raw_mask = self.generate_mask(window_len)
             current_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
+
+            # 恢复随机状态
+            np.random.set_state(old_state)
         else:
             # 使用预生成的mask (用于training,保持一致性)
             current_mask = self.window_masks[window_idx]
