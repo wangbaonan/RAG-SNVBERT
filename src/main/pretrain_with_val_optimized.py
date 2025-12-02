@@ -490,6 +490,11 @@ class BERTTrainerWithValidationOptimized():
 
     def save(self, epoch, file_path="output/bert_trained.model", is_best=False):
         """保存模型"""
+        # 创建输出目录
+        from pathlib import Path
+        output_dir = Path(file_path).parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+
         output_path = file_path + f".ep{epoch}"
         if isinstance(self.model, nn.DataParallel):
             torch.save(self.model.module.cpu(), output_path)
