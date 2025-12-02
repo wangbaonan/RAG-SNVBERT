@@ -222,8 +222,10 @@ class BERTTrainerWithValidationOptimized():
                         hap_2_loss = self.hap_criterion(output[1][masks], labels['hap_2'][masks])
                         gt_loss = self.gt_criterion(output[2][masks], labels['gt'][masks])
 
-                        recon_loss1 = self.recon_critetion(output[3][masks], output[5][masks])
-                        recon_loss2 = self.recon_critetion(output[4][masks], output[6][masks])
+                        # 验证时也需要条件判断
+                        if self.use_recon_loss:
+                            recon_loss1 = self.recon_critetion(output[3][masks], output[5][masks])
+                            recon_loss2 = self.recon_critetion(output[4][masks], output[6][masks])
 
             # 计算指标 (训练和验证都需要)
             with torch.no_grad():
@@ -279,7 +281,11 @@ class BERTTrainerWithValidationOptimized():
 
                 eval_dict['hap_loss'] += (hap_1_loss.item() + hap_2_loss.item())
                 eval_dict['gt_loss'] += gt_loss.item()
-                eval_dict['recon_loss'] += (recon_loss1.item() + recon_loss2.item())
+
+                # 只有在使用recon loss时才记录
+                if self.use_recon_loss:
+                    eval_dict['recon_loss'] += (recon_loss1.item() + recon_loss2.item())
+
                 eval_dict['hap_correct'] += (hap_1_acc + hap_2_acc)
                 eval_dict['gt_correct'] += gt_acc
                 eval_dict['hap_numbers'] += (hap_1_tot + hap_2_tot)
@@ -315,8 +321,11 @@ class BERTTrainerWithValidationOptimized():
             "avg_hap_acc": eval_dict['hap_correct'] / eval_dict['hap_numbers'] * 100,
             "avg_gt_loss": eval_dict['gt_loss'] / (iter_step + 1),
             "avg_gt_acc": eval_dict['gt_correct'] / eval_dict['gt_numbers'] * 100,
-            "avg_recon_loss": eval_dict['recon_loss'] / (iter_step + 1)
         }
+
+        # 只有使用recon loss时才添加到log
+        if self.use_recon_loss:
+            log_dict["avg_recon_loss"] = eval_dict['recon_loss'] / (iter_step + 1)
 
         data_iter.write(pprint.pformat(log_dict))
 
