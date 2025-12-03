@@ -66,7 +66,7 @@ def main():
 
     # GPU参数
     parser.add_argument("--cuda_devices", type=int, default=0, help="GPU设备")
-    parser.add_argument("--num_workers", type=int, default=4, help="数据加载worker数")
+    parser.add_argument("--num_workers", type=int, default=0, help="数据加载worker数 (V18必须为0，避免CUDA fork error)")
 
     # 输出参数
     parser.add_argument("--output_path", required=True, type=str, help="模型保存路径")
@@ -170,12 +170,12 @@ def main():
     train_dataloader = DataLoader(
         rag_train_loader,
         batch_size=args.train_batch_size,
-        num_workers=args.num_workers,
+        num_workers=0,  # V18: 必须为0，避免CUDA fork error (collate_fn使用GPU)
         collate_fn=lambda batch: embedding_rag_collate_fn(
             batch, rag_train_loader, embedding_layer, args.rag_k
         ),
         shuffle=True,
-        pin_memory=True
+        pin_memory=False  # num_workers=0时pin_memory无效
     )
 
     print(f"✓ Training dataset: {len(rag_train_loader)} samples, {len(train_dataloader)} batches")
@@ -208,12 +208,12 @@ def main():
         val_dataloader = DataLoader(
             rag_val_loader,
             batch_size=args.val_batch_size,
-            num_workers=args.num_workers,
+            num_workers=0,  # V18: 必须为0，避免CUDA fork error
             collate_fn=lambda batch: embedding_rag_collate_fn(
                 batch, rag_val_loader, embedding_layer, args.rag_k
             ),
             shuffle=False,
-            pin_memory=True
+            pin_memory=False  # num_workers=0时pin_memory无效
         )
 
         print(f"✓ Validation dataset: {len(rag_val_loader)} samples, {len(val_dataloader)} batches")
