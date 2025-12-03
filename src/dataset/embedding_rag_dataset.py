@@ -265,13 +265,14 @@ class EmbeddingRAGDataset(TrainDataset):
         """从磁盘加载FAISS索引"""
         return faiss.read_index(self.index_paths[w_idx])
 
-    def encode_complete_embeddings(self, w_idx, device='cuda'):
+    def encode_complete_embeddings(self, w_idx, device='cuda', grad_enabled=False):
         """
-        按需编码complete embeddings (不预存储)
+        按需编码complete embeddings (支持梯度回传)
 
         Args:
             w_idx: 窗口索引
             device: GPU设备
+            grad_enabled: 是否启用梯度计算 (训练时True, 索引重建时False)
 
         Returns:
             ref_emb_complete: [num_haps, L, D] GPU tensor
@@ -283,15 +284,124 @@ class EmbeddingRAGDataset(TrainDataset):
         num_haps = ref_tokens.shape[0]
         ref_af_expanded = np.tile(ref_af, (num_haps, 1))
 
-        # 编码
-        with torch.no_grad():
+        # 编码 (根据grad_enabled决定是否启用梯度)
+        if grad_enabled:
+            # 训练模式：启用梯度，让Reference编码参与端到端学习
             ref_emb = self.embedding_layer(
                 torch.LongTensor(ref_tokens).to(device),
                 af=torch.FloatTensor(ref_af_expanded).to(device),
                 pos=True
             )
+        else:
+            # 索引重建模式：不需要梯度
+            with torch.no_grad():
+                ref_emb = self.embedding_layer(
+                    torch.LongTensor(ref_tokens).to(device),
+                    af=torch.FloatTensor(ref_af_expanded).to(device),
+                    pos=True
+                )
 
         return ref_emb  # [num_haps, L, D] 在GPU上
+
+    def process_batch_retrieval(self, batch, embedding_layer, device, k_retrieve=1):
+        """
+        在主进程中执行RAG检索 (带梯度的端到端学习)
+
+        关键改进:
+        1. 在主进程执行，无CUDA fork风险
+        2. Query编码和Reference编码都在计算图中（grad_enabled=True）
+        3. 梯度可以从Reference回传到Embedding层
+        4. 真正实现End-to-End Learnable RAG
+
+        核心流程:
+        1. 编码Query (masked版本, 带梯度)
+        2. 在FAISS中检索最近邻 (masked space, 语义对齐)
+        3. 编码Retrieved Reference (complete版本, 带梯度!)
+        4. 返回带梯度的RAG embeddings
+
+        Args:
+            batch: CPU batch from DataLoader (dict)
+            embedding_layer: Embedding层 (用于编码)
+            device: GPU设备
+            k_retrieve: 检索K个最近邻
+
+        Returns:
+            batch: 增强后的batch，包含 'rag_emb_h1' 和 'rag_emb_h2'
+        """
+        # 1. 将batch数据移到GPU
+        h1_tokens = batch['hap_1'].to(device)  # [B, L] masked tokens
+        h2_tokens = batch['hap_2'].to(device)
+        af_batch = batch['af'].to(device)
+        window_idx_list = batch['window_idx']  # list
+
+        # 2. 按窗口分组
+        window_groups = defaultdict(list)
+        for i, win_idx in enumerate(window_idx_list):
+            win_idx = int(win_idx)
+            window_groups[win_idx].append(i)
+
+        # 初始化RAG embedding存储
+        B = h1_tokens.size(0)
+        L = h1_tokens.size(1)
+        D = self.embed_dim
+
+        # 使用list存储，最后stack
+        rag_emb_h1_list = []
+        rag_emb_h2_list = []
+
+        # 3. 处理每个窗口（带梯度）
+        for win_idx, indices in window_groups.items():
+            # 获取当前窗口的样本
+            h1_win = h1_tokens[indices]  # [B_win, L]
+            h2_win = h2_tokens[indices]
+            af_win = af_batch[indices]
+
+            # === 步骤1: 编码Query (带梯度!) ===
+            h1_emb = embedding_layer(h1_win, af=af_win, pos=True)  # [B_win, L, D]
+            h2_emb = embedding_layer(h2_win, af=af_win, pos=True)
+
+            B_win = h1_emb.size(0)
+
+            # === 步骤2: FAISS检索 (在masked space, 但不需要梯度) ===
+            # 注意: FAISS检索本身不可微，但检索结果用于索引Reference
+            with torch.no_grad():
+                # 加载FAISS索引
+                index = self.load_index(win_idx)
+
+                # Flatten并检索
+                h1_emb_flat = h1_emb.reshape(B_win, L * D).cpu().numpy().astype(np.float32)
+                h2_emb_flat = h2_emb.reshape(B_win, L * D).cpu().numpy().astype(np.float32)
+
+                D1, I1 = index.search(h1_emb_flat, k=k_retrieve)  # [B_win, k]
+                D2, I2 = index.search(h2_emb_flat, k=k_retrieve)
+
+            # === 步骤3: 编码Retrieved Reference (带梯度!) ===
+            # 关键: grad_enabled=True，让Reference参与端到端学习
+            ref_emb_complete = self.encode_complete_embeddings(
+                win_idx, device=device, grad_enabled=True
+            )  # [num_haps, L, D] 在GPU上，带梯度!
+
+            # === 步骤4: 收集Retrieved Embeddings (保持梯度) ===
+            for i in range(B_win):
+                # h1的top-k
+                topk_h1 = []
+                for k in range(k_retrieve):
+                    ref_idx = I1[i, k]
+                    topk_h1.append(ref_emb_complete[ref_idx])  # [L, D] 带梯度!
+                rag_emb_h1_list.append(torch.stack(topk_h1))  # [k, L, D]
+
+                # h2的top-k
+                topk_h2 = []
+                for k in range(k_retrieve):
+                    ref_idx = I2[i, k]
+                    topk_h2.append(ref_emb_complete[ref_idx])  # [L, D] 带梯度!
+                rag_emb_h2_list.append(torch.stack(topk_h2))  # [k, L, D]
+
+        # 4. 堆叠为batch (保持梯度)
+        batch['rag_emb_h1'] = torch.stack(rag_emb_h1_list)  # [B, k, L, D]
+        batch['rag_emb_h2'] = torch.stack(rag_emb_h2_list)
+
+        return batch
 
     def rebuild_indexes(self, embedding_layer, device='cuda'):
         """
@@ -464,84 +574,40 @@ class EmbeddingRAGDataset(TrainDataset):
         return rag_dataset
 
 
-def embedding_rag_collate_fn(batch_list, dataset, embedding_layer, k_retrieve=1):
+def embedding_rag_collate_fn(batch_list, dataset=None, embedding_layer=None, k_retrieve=1):
     """
-    Embedding RAG的collate函数 (修改版 - 支持mask对齐)
+    纯CPU Collate函数 (重构版 - 解耦加载与计算)
 
-    核心流程:
-    1. Query用当前mask编码 (已在__getitem__中tokenized)
-    2. 在FAISS中检索 (索引基于masked embeddings, 语义对齐)
-    3. 返回COMPLETE embeddings (提供完整信息给模型)
+    关键改进:
+    - 只在CPU上堆叠基础数据 (tokens, AF, pos, window_idx)
+    - 不做任何GPU操作，不调用embedding_layer
+    - 不执行检索逻辑
+    - 支持 num_workers > 0 (无CUDA fork风险)
 
-    关键设计:
-    - 检索阶段: Query和Reference都是masked (语义对齐)
-    - 使用阶段: 返回complete embeddings (提供完整信息)
+    检索和编码逻辑移至 dataset.process_batch_retrieval() 在主进程执行
+
+    Args:
+        batch_list: list of samples from __getitem__
+        dataset: 保留参数兼容性，但本函数不使用
+        embedding_layer: 保留参数兼容性，但本函数不使用
+        k_retrieve: 保留参数兼容性，但本函数不使用
     """
     final_batch = defaultdict(list)
-    device = next(embedding_layer.parameters()).device
 
-    # 按窗口分组
-    window_groups = defaultdict(list)
+    # 简单堆叠所有样本的数据
     for sample in batch_list:
-        win_idx = int(sample['window_idx'])
-        window_groups[win_idx].append(sample)
+        for key in sample:
+            final_batch[key].append(sample[key])
 
-    # 处理每个窗口
-    with torch.no_grad():  # 检索操作不需要梯度
-        for win_idx, group in window_groups.items():
-            # 1. 从磁盘加载FAISS索引
-            index = dataset.load_index(win_idx)
-
-            # 2. 批量编码queries (用当前mask, 已在__getitem__中tokenized)
-            h1_tokens = torch.stack([s['hap_1'] for s in group]).to(device)  # [B, L] (已masked)
-            h2_tokens = torch.stack([s['hap_2'] for s in group]).to(device)  # [B, L] (已masked)
-            af_batch = torch.stack([s['af'] for s in group]).to(device)  # [B, L]
-
-            # 3. 编码query (masked版本, 与索引语义对齐)
-            h1_emb = embedding_layer(h1_tokens, af=af_batch, pos=True)  # [B, L, D]
-            h2_emb = embedding_layer(h2_tokens, af=af_batch, pos=True)
-
-            B, L, D = h1_emb.shape
-
-            # 4. Flatten并检索 (在masked space检索)
-            h1_emb_flat = h1_emb.reshape(B, L * D).cpu().numpy().astype(np.float32)
-            h2_emb_flat = h2_emb.reshape(B, L * D).cpu().numpy().astype(np.float32)
-
-            D1, I1 = index.search(h1_emb_flat, k=k_retrieve)  # [B, k]
-            D2, I2 = index.search(h2_emb_flat, k=k_retrieve)
-
-            # 5. 按需编码complete embeddings (不从内存读取!)
-            ref_emb_complete = dataset.encode_complete_embeddings(win_idx, device=device)
-            # [num_haps, L, D] 在GPU上
-
-            # 6. 收集retrieved embeddings (返回COMPLETE版本!)
-            for i, sample in enumerate(group):
-                # h1的top-k (完整embeddings)
-                topk_h1 = []
-                for k in range(k_retrieve):
-                    ref_idx = I1[i, k]
-                    topk_h1.append(ref_emb_complete[ref_idx])  # [L, D] - 完整!
-                sample['rag_emb_h1'] = torch.stack(topk_h1)  # [k, L, D]
-
-                # h2的top-k (完整embeddings)
-                topk_h2 = []
-                for k in range(k_retrieve):
-                    ref_idx = I2[i, k]
-                    topk_h2.append(ref_emb_complete[ref_idx])  # [L, D] - 完整!
-                sample['rag_emb_h2'] = torch.stack(topk_h2)  # [k, L, D]
-
-            # 收集数据
-            for sample in group:
-                for key in sample:
-                    final_batch[key].append(sample[key])
-
-    # 转换为张量
+    # 转换为张量（只在CPU上操作）
     for key in final_batch:
         if key in ["window_idx", "hap1_nomask", "hap2_nomask"]:
+            # window_idx保持为list，其他保持原样
             continue
         try:
             final_batch[key] = torch.stack(final_batch[key])
-        except RuntimeError as e:
-            print(f"Warning: Failed to stack {key}: {e}")
+        except (RuntimeError, TypeError) as e:
+            # 如果无法stack，保持为list
+            pass
 
     return dict(final_batch)

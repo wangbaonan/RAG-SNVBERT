@@ -158,12 +158,24 @@ class BERTTrainerWithValidationOptimized():
                         total=len(dataloader), bar_format="{l_bar}{r_bar}")
 
         for i, data in data_iter:
+            # === 关键改进: 在主进程执行RAG检索 (带梯度) ===
+            # 检查是否是Embedding RAG模式 (有rag_train_dataset属性)
+            if hasattr(self, 'rag_train_dataset') or hasattr(self, 'rag_val_dataset'):
+                # 选择对应的dataset
+                rag_dataset = self.rag_train_dataset if train else self.rag_val_dataset
+                if rag_dataset is not None and hasattr(self, 'embedding_layer'):
+                    # 调用process_batch_retrieval进行带梯度的检索
+                    data = rag_dataset.process_batch_retrieval(
+                        data,
+                        self.embedding_layer,
+                        self.device,
+                        k_retrieve=getattr(self, 'rag_k', 1)
+                    )
+
             # 准备数据
             gpu_data = {
                 'hap_1': data['hap_1'].to(self.device, non_blocking=True, dtype=torch.long),
                 'hap_2': data['hap_2'].to(self.device, non_blocking=True, dtype=torch.long),
-                'rag_seg_h1': data['rag_seg_h1'].to(self.device, non_blocking=True, dtype=torch.long),
-                'rag_seg_h2': data['rag_seg_h2'].to(self.device, non_blocking=True, dtype=torch.long),
                 'pos': data['pos'].to(self.device, non_blocking=True, dtype=torch.float),
                 'af': data['af'].to(self.device, non_blocking=True, dtype=torch.float),
                 'af_p': data['af_p'].to(self.device, non_blocking=True, dtype=torch.float),
@@ -171,6 +183,18 @@ class BERTTrainerWithValidationOptimized():
                 'het': data['het'].to(self.device, non_blocking=True, dtype=torch.float),
                 'hom': data['hom'].to(self.device, non_blocking=True, dtype=torch.float)
             }
+
+            # 添加RAG embeddings (如果存在)
+            if 'rag_emb_h1' in data:
+                gpu_data['rag_emb_h1'] = data['rag_emb_h1']  # 已在GPU上，带梯度!
+            if 'rag_emb_h2' in data:
+                gpu_data['rag_emb_h2'] = data['rag_emb_h2']  # 已在GPU上，带梯度!
+
+            # 兼容旧版: 如果有rag_seg则添加
+            if 'rag_seg_h1' in data:
+                gpu_data['rag_seg_h1'] = data['rag_seg_h1'].to(self.device, non_blocking=True, dtype=torch.long)
+            if 'rag_seg_h2' in data:
+                gpu_data['rag_seg_h2'] = data['rag_seg_h2'].to(self.device, non_blocking=True, dtype=torch.long)
 
             masks = data['mask'].to(self.device, non_blocking=True, dtype=torch.bool)
             labels = {

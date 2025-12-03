@@ -151,10 +151,14 @@ class EnhancedRareVariantFusion(nn.Module):
         
         fused = self.fusion(torch.cat([orig_feat, pooled_ref], dim=-1))  # [B, L, 2D] -> [B, L, D]
         
-        # MAF逆向加权
-        maf = torch.min(global_af, 1 - global_af).unsqueeze(-1)
-        maf_weight = (1.0 / (maf + 1e-6)).clamp(max=10.0)
-        
+        # MAF逆向加权 (优化版: 使用log1p平滑处理)
+        maf = torch.min(global_af, 1 - global_af).unsqueeze(-1)  # [B, L, 1]
+
+        # 使用log1p平滑处理，避免梯度爆炸
+        # log1p(1/x) = -log1p(x-1) ≈ -log(x) for small x
+        # 对于小MAF，权重增加；对于大MAF，权重减少
+        maf_weight = torch.log1p(1.0 / (maf + 1e-6)).clamp(max=3.0)  # 降低max阈值
+
         return orig_feat + self.res_scale * (fused * maf_weight)
 
 

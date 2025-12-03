@@ -37,14 +37,14 @@ def main():
     parser.add_argument("--pos_path", required=True, type=str, help="pos映射文件")
 
     # 模型参数
-    parser.add_argument("--dims", type=int, default=192, help="模型维度")
-    parser.add_argument("--layers", type=int, default=10, help="Transformer层数")
-    parser.add_argument("--attn_heads", type=int, default=6, help="注意力头数")
+    parser.add_argument("--dims", type=int, default=384, help="模型维度 (RAG任务推荐384+)")
+    parser.add_argument("--layers", type=int, default=12, help="Transformer层数")
+    parser.add_argument("--attn_heads", type=int, default=12, help="注意力头数")
 
     # 训练参数
     parser.add_argument("--epochs", type=int, default=20, help="训练轮数")
-    parser.add_argument("--train_batch_size", type=int, default=32, help="训练batch size")
-    parser.add_argument("--val_batch_size", type=int, default=64, help="验证batch size")
+    parser.add_argument("--train_batch_size", type=int, default=24, help="训练batch size (384维推荐24)")
+    parser.add_argument("--val_batch_size", type=int, default=48, help="验证batch size")
     parser.add_argument("--lr", type=float, default=7.5e-5, help="学习率")
     parser.add_argument("--warmup_steps", type=int, default=15000, help="warmup步数")
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="梯度累积步数")
@@ -66,7 +66,7 @@ def main():
 
     # GPU参数
     parser.add_argument("--cuda_devices", type=int, default=0, help="GPU设备")
-    parser.add_argument("--num_workers", type=int, default=0, help="数据加载worker数 (V18必须为0，避免CUDA fork error)")
+    parser.add_argument("--num_workers", type=int, default=4, help="数据加载worker数 (重构后支持多worker)")
 
     # 输出参数
     parser.add_argument("--output_path", required=True, type=str, help="模型保存路径")
@@ -170,12 +170,10 @@ def main():
     train_dataloader = DataLoader(
         rag_train_loader,
         batch_size=args.train_batch_size,
-        num_workers=0,  # V18: 必须为0，避免CUDA fork error (collate_fn使用GPU)
-        collate_fn=lambda batch: embedding_rag_collate_fn(
-            batch, rag_train_loader, embedding_layer, args.rag_k
-        ),
+        num_workers=args.num_workers,  # 重构后支持多worker (纯CPU collate_fn)
+        collate_fn=embedding_rag_collate_fn,  # 简化collate_fn，不传参数
         shuffle=True,
-        pin_memory=False  # num_workers=0时pin_memory无效
+        pin_memory=True  # 加速CPU->GPU传输
     )
 
     print(f"✓ Training dataset: {len(rag_train_loader)} samples, {len(train_dataloader)} batches")
@@ -208,12 +206,10 @@ def main():
         val_dataloader = DataLoader(
             rag_val_loader,
             batch_size=args.val_batch_size,
-            num_workers=0,  # V18: 必须为0，避免CUDA fork error
-            collate_fn=lambda batch: embedding_rag_collate_fn(
-                batch, rag_val_loader, embedding_layer, args.rag_k
-            ),
+            num_workers=args.num_workers,  # 重构后支持多worker
+            collate_fn=embedding_rag_collate_fn,  # 简化collate_fn
             shuffle=False,
-            pin_memory=False  # num_workers=0时pin_memory无效
+            pin_memory=True  # 加速CPU->GPU传输
         )
 
         print(f"✓ Validation dataset: {len(rag_val_loader)} samples, {len(val_dataloader)} batches")
@@ -242,6 +238,13 @@ def main():
         rare_threshold=args.rare_threshold,
         output_csv=args.metrics_csv
     )
+
+    # === 关键: 传递RAG相关信息给trainer ===
+    # 让trainer能够在训练循环中调用process_batch_retrieval
+    trainer.rag_train_dataset = rag_train_loader
+    trainer.rag_val_dataset = rag_val_loader
+    trainer.embedding_layer = embedding_layer
+    trainer.rag_k = args.rag_k
 
     # 训练循环
     print(f"\n{'='*80}")
