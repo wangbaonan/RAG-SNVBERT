@@ -156,17 +156,19 @@ class EmbeddingRAGDataset(TrainDataset):
 
                 # === 步骤3: 计算AF (Reference的真实AF) ===
                 # 从reference panel计算每个位点的AF
-                ref_af = np.zeros(MAX_SEQ_LEN, dtype=np.float32)
+                # 注意: 使用raw_ref的实际长度，而不是MAX_SEQ_LEN
+                actual_len = raw_ref.shape[1]  # raw_ref is [num_haps, L]
+                ref_af = np.zeros(actual_len, dtype=np.float32)
                 # AF=3, GLOBAL=5 (constants from dataset.py)
                 AF_IDX = 3
                 GLOBAL_IDX = 5
                 for pos_idx in range(len(train_pos)):
                     p = train_pos[pos_idx]
-                    if p in self.pos_to_idx:
+                    if p in self.pos_to_idx and pos_idx < actual_len:
                         # 使用global AF (可以改为population-specific)
                         ref_af[pos_idx] = self.freq[AF_IDX][GLOBAL_IDX][self.pos_to_idx[p]]
 
-                # Padding部分的AF设为0
+                # Padding到MAX_SEQ_LEN
                 ref_af = VCFProcessingModule.sequence_padding(ref_af, dtype='float')  # [MAX_SEQ_LEN]
 
                 # 保存AF信息用于后续刷新
