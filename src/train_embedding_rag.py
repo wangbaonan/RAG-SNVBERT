@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .dataset.embedding_rag_dataset import EmbeddingRAGDataset, embedding_rag_collate_fn
+from .dataset.sampler import WindowGroupedSampler  # ✅ 导入Window-Grouped Sampler
 from .dataset import PanelData, WordVocab
 from .model.bert import BERTWithEmbeddingRAG
 from .model.foundation_model import BERTFoundationModel
@@ -167,16 +168,21 @@ def main():
         use_dynamic_mask=True  # V18优势: 支持dynamic mask! 每个epoch索引会刷新
     )
 
+    # === 性能优化: 使用Window-Grouped Sampler (减少磁盘I/O) ===
+    # 将同一窗口的样本聚类在一起训练，配合单槽位缓存实现零I/O
+    train_sampler = WindowGroupedSampler(rag_train_loader, shuffle=True, seed=42)
+
     train_dataloader = DataLoader(
         rag_train_loader,
         batch_size=args.train_batch_size,
         num_workers=args.num_workers,  # 重构后支持多worker (纯CPU collate_fn)
         collate_fn=embedding_rag_collate_fn,  # 简化collate_fn，不传参数
-        shuffle=True,
+        sampler=train_sampler,  # ✅ 使用Window-Grouped Sampler (不能与shuffle=True同时使用)
         pin_memory=True  # 加速CPU->GPU传输
     )
 
     print(f"✓ Training dataset: {len(rag_train_loader)} samples, {len(train_dataloader)} batches")
+    print(f"✓ Using WindowGroupedSampler for optimal I/O performance")
 
     # 加载验证数据
     rag_val_loader = None

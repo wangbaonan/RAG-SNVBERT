@@ -57,9 +57,14 @@ class EmbeddingRAGDataset(TrainDataset):
         self.ref_af_windows = []          # AF信息 [window_idx][L]
         self.window_actual_lens = []      # 每个窗口过滤后的实际长度 [window_idx]
 
-        # FAISS索引路径 (保存到磁盘，不占用内存)
+        # FAISS索引路径 (保存到磁盘作为备份)
         self.index_dir = os.path.join(os.path.dirname(ref_vcf_path) if ref_vcf_path else ".", "faiss_indexes")
         self.index_paths = []             # 索引文件路径
+
+        # === 性能优化: 全内存缓存FAISS索引 (避免磁盘I/O) ===
+        self.memory_indexes = {}          # {window_idx: faiss.Index} 内存中持有所有索引
+        self.cached_index = None          # 单槽位缓存 (用于Window-Grouped Sampling优化)
+        self.cached_window_idx = -1       # 当前缓存的窗口ID
 
         # 存储embedding layer引用 (用于按需编码)
         self.embedding_layer = embedding_layer
@@ -201,13 +206,17 @@ class EmbeddingRAGDataset(TrainDataset):
                 index = faiss.IndexFlatL2(L * D)  # L*D维空间
                 index.add(ref_emb_masked_flat_np)
 
-                # === 步骤6: 保存FAISS索引到磁盘 (不保存到内存!) ===
+                # === 步骤6: 保存FAISS索引 (磁盘备份 + 内存缓存) ===
+                # 保存到磁盘作为备份 (用于调试或恢复)
                 index_path = os.path.join(self.index_dir, f"index_{w_idx}.faiss")
                 faiss.write_index(index, index_path)
                 self.index_paths.append(index_path)
 
-                # 清理GPU内存
-                del ref_tokens_masked_tensor, ref_af_tensor, ref_emb_masked, ref_emb_masked_flat, ref_emb_masked_flat_np, index
+                # ✅ 关键优化: 同时保存到内存缓存 (避免训练时磁盘I/O)
+                self.memory_indexes[w_idx] = index
+
+                # 清理GPU内存 (但保留FAISS索引在CPU内存)
+                del ref_tokens_masked_tensor, ref_af_tensor, ref_emb_masked, ref_emb_masked_flat, ref_emb_masked_flat_np
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
 
@@ -262,8 +271,40 @@ class EmbeddingRAGDataset(TrainDataset):
         print(f"{'='*80}\n")
 
     def load_index(self, w_idx):
-        """从磁盘加载FAISS索引"""
-        return faiss.read_index(self.index_paths[w_idx])
+        """
+        加载FAISS索引 (内存优先策略)
+
+        策略优先级:
+        1. 全内存缓存 (self.memory_indexes) - 零磁盘I/O
+        2. 单槽位缓存 (self.cached_index) - 用于Window-Grouped Sampling
+        3. 磁盘读取 (faiss.read_index) - 仅作为回退方案
+
+        Args:
+            w_idx: 窗口索引
+
+        Returns:
+            faiss.Index对象
+        """
+        # === 优先级1: 全内存缓存 (训练热路径) ===
+        if w_idx in self.memory_indexes:
+            return self.memory_indexes[w_idx]
+
+        # === 优先级2: 单槽位缓存 (用于Window-Grouped Sampling) ===
+        if w_idx == self.cached_window_idx and self.cached_index is not None:
+            return self.cached_index
+
+        # === 优先级3: 磁盘读取 (回退方案，不应该发生) ===
+        print(f"⚠️ Warning: Loading index {w_idx} from disk (should not happen in training)")
+
+        # 释放旧缓存
+        if self.cached_index is not None:
+            del self.cached_index
+
+        # 从磁盘读取
+        self.cached_index = faiss.read_index(self.index_paths[w_idx])
+        self.cached_window_idx = w_idx
+
+        return self.cached_index
 
     def encode_complete_embeddings(self, w_idx, device='cuda', grad_enabled=False):
         """
@@ -483,8 +524,11 @@ class EmbeddingRAGDataset(TrainDataset):
                 index_path = self.index_paths[w_idx]
                 faiss.write_index(index, index_path)
 
-                # 清理GPU内存
-                del ref_tokens_tensor, ref_af_tensor, ref_emb_masked, ref_emb_flat, ref_emb_flat_np, index
+                # ✅ 关键优化: 同步更新内存缓存 (避免使用过期索引)
+                self.memory_indexes[w_idx] = index
+
+                # 清理GPU内存 (但保留FAISS索引在CPU内存)
+                del ref_tokens_tensor, ref_af_tensor, ref_emb_masked, ref_emb_flat, ref_emb_flat_np
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
 
