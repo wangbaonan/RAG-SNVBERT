@@ -108,8 +108,31 @@ class EmbeddingRAGDataset(TrainDataset):
                 )
                 window_len = current_slice.stop - current_slice.start
 
-                # === 步骤1: 生成mask (用于语义对齐) ===
-                current_pos = self.pos[current_slice]
+                # === 步骤1: 先处理参考数据以确定有效位点 ===
+                train_pos = self.pos[current_slice]
+                ref_indices = []
+                valid_pos_mask = []
+
+                for idx, p in enumerate(train_pos):
+                    matches = np.where(ref_pos == p)[0]
+                    if len(matches) > 0:
+                        ref_indices.append(matches[0])
+                        valid_pos_mask.append(idx)
+
+                # 如果有位点被过滤，更新current_slice和train_pos
+                if len(ref_indices) < len(train_pos):
+                    if len(valid_pos_mask) == 0:
+                        print(f"  ⚠ 跳过窗口 {w_idx}: 没有可用位点")
+                        continue
+                    # 关键修复: 同时更新current_slice和train_pos
+                    valid_indices = current_slice.start + np.array(valid_pos_mask)
+                    current_slice = valid_indices
+                    train_pos = train_pos[valid_pos_mask]
+                    # 更新window_len为过滤后的长度
+                    window_len = len(train_pos)
+
+                # === 步骤2: 生成mask (用于语义对齐) ===
+                # 现在基于过滤后的window_len生成mask
                 raw_mask = self.generate_mask(window_len)
                 padded_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
 
@@ -122,23 +145,6 @@ class EmbeddingRAGDataset(TrainDataset):
                 padded_mask_complete = VCFProcessingModule.sequence_padding(
                     raw_mask_complete, dtype='int'
                 )
-
-                # === 步骤2: 处理参考数据 ===
-                train_pos = self.pos[current_slice]
-                ref_indices = []
-                valid_pos_mask = []
-
-                for idx, p in enumerate(train_pos):
-                    matches = np.where(ref_pos == p)[0]
-                    if len(matches) > 0:
-                        ref_indices.append(matches[0])
-                        valid_pos_mask.append(idx)
-
-                if len(ref_indices) < len(train_pos):
-                    if len(valid_pos_mask) == 0:
-                        print(f"  ⚠ 跳过窗口 {w_idx}: 没有可用位点")
-                        continue
-                    train_pos = train_pos[valid_pos_mask]
 
                 # 获取reference sequences
                 raw_ref = ref_gt[current_slice, :, :]  # [L, num_samples, 2]
@@ -156,17 +162,16 @@ class EmbeddingRAGDataset(TrainDataset):
 
                 # === 步骤3: 计算AF (Reference的真实AF) ===
                 # 从reference panel计算每个位点的AF
-                # 注意: 使用raw_ref的实际长度，而不是MAX_SEQ_LEN
-                actual_len = raw_ref.shape[1]  # raw_ref is [num_haps, L]
-                ref_af = np.zeros(actual_len, dtype=np.float32)
+                # 现在train_pos和raw_ref维度已对齐，可以安全计算
                 # AF=3, GLOBAL=5 (constants from dataset.py)
                 AF_IDX = 3
                 GLOBAL_IDX = 5
-                for pos_idx in range(len(train_pos)):
-                    p = train_pos[pos_idx]
-                    if p in self.pos_to_idx and pos_idx < actual_len:
-                        # 使用global AF (可以改为population-specific)
-                        ref_af[pos_idx] = self.freq[AF_IDX][GLOBAL_IDX][self.pos_to_idx[p]]
+                # 使用列表推导式，类似base dataset的实现
+                ref_af = np.array([
+                    self.freq[AF_IDX][GLOBAL_IDX][self.pos_to_idx[p]]
+                    if p in self.pos_to_idx else 0.0
+                    for p in train_pos
+                ], dtype=np.float32)
 
                 # Padding到MAX_SEQ_LEN
                 ref_af = VCFProcessingModule.sequence_padding(ref_af, dtype='float')  # [MAX_SEQ_LEN]
