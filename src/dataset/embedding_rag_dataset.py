@@ -51,17 +51,17 @@ class EmbeddingRAGDataset(TrainDataset):
 
         # Embedding RAG特有的数据结构
         self.ref_tokens_complete = []     # 完整tokens (无mask) [window_idx][num_haps, L]
-        self.ref_tokens_masked = []       # Masked tokens (用于检索) [window_idx][num_haps, L]
-        self.ref_embeddings_complete = [] # 完整embeddings (返回给模型) [window_idx][num_haps, L, D] (CPU)
-        self.ref_embeddings_masked = []   # Masked embeddings (用于FAISS索引) [window_idx][num_haps, L, D] (CPU)
-        self.embedding_indexes = []       # FAISS索引 (基于masked embeddings) [window_idx]
         self.raw_window_masks = []        # 原始mask
         self.window_masks = []            # 填充后的mask
         self.mask_version = 0             # 当前mask版本号
         self.ref_af_windows = []          # AF信息 [window_idx][L]
         self.window_actual_lens = []      # 每个窗口过滤后的实际长度 [window_idx]
 
-        # 存储embedding layer引用 (用于刷新)
+        # FAISS索引路径 (保存到磁盘，不占用内存)
+        self.index_dir = os.path.join(os.path.dirname(ref_vcf_path) if ref_vcf_path else ".", "faiss_indexes")
+        self.index_paths = []             # 索引文件路径
+
+        # 存储embedding layer引用 (用于按需编码)
         self.embedding_layer = embedding_layer
         self.embed_dim = embedding_layer.embed_size if embedding_layer else None
 
@@ -70,23 +70,23 @@ class EmbeddingRAGDataset(TrainDataset):
 
     def _build_embedding_indexes(self, ref_vcf_path: str, embedding_layer):
         """
-        构建Embedding-based FAISS索引 (修改版 - 支持mask对齐)
+        构建Embedding-based FAISS索引 (内存优化版)
 
-        核心流程:
-        1. 加载reference data
-        2. 对每个window:
-           - 生成mask (用于检索阶段的语义对齐)
-           - Tokenize两个版本:
-             a) Masked版本: 用于构建FAISS索引 (与Query mask一致)
-             b) Complete版本: 用于返回给模型 (提供完整信息)
-           - 编码两个版本的embeddings
-           - 用masked embeddings构建FAISS索引
-           - 存储complete embeddings用于返回
+        核心改进:
+        1. 只在内存保存tokens和AF (小数据)
+        2. FAISS索引保存到磁盘 (不占内存)
+        3. Complete embeddings按需编码 (不预存储)
+
+        内存消耗: ~11GB (vs 1.6TB原设计)
         """
         print("=" * 80)
-        print("▣ 构建Embedding-based RAG索引")
+        print("▣ 构建Embedding-based RAG索引 (内存优化版)")
         print("=" * 80)
         start_time = time.time()
+
+        # 创建FAISS索引目录
+        os.makedirs(self.index_dir, exist_ok=True)
+        print(f"✓ FAISS索引目录: {self.index_dir}")
 
         # 加载参考数据
         load_start = time.time()
@@ -158,11 +158,10 @@ class EmbeddingRAGDataset(TrainDataset):
                 # Tokenize两个版本
                 # 1. Masked版本: 用于检索 (与Query语义对齐)
                 ref_tokens_masked = self.tokenize(raw_ref, padded_mask)  # [num_haps, MAX_SEQ_LEN]
-                self.ref_tokens_masked.append(ref_tokens_masked)
 
-                # 2. Complete版本: 用于返回给模型 (提供完整信息)
+                # 2. Complete版本: 用于按需编码 (提供完整信息)
                 ref_tokens_complete = self.tokenize(raw_ref, padded_mask_complete)  # [num_haps, MAX_SEQ_LEN]
-                self.ref_tokens_complete.append(ref_tokens_complete)
+                self.ref_tokens_complete.append(ref_tokens_complete)  # 只保存complete tokens
 
                 # === 步骤3: 计算AF (Reference的真实AF) ===
                 # 从reference panel计算每个位点的AF
@@ -187,15 +186,11 @@ class EmbeddingRAGDataset(TrainDataset):
                 num_haps_in_window = ref_tokens_masked.shape[0]
                 ref_af_expanded = np.tile(ref_af, (num_haps_in_window, 1))  # [num_haps, MAX_SEQ_LEN]
 
-                # === 步骤4: 编码两个版本的embeddings (传入AF!) ===
-                # 4a. Masked版本 (用于检索)
+                # === 步骤4: 编码masked版本并构建FAISS索引 ===
+                # 只编码masked版本 (用于构建索引)
                 ref_tokens_masked_tensor = torch.LongTensor(ref_tokens_masked).to(device)
                 ref_af_tensor = torch.FloatTensor(ref_af_expanded).to(device)
                 ref_emb_masked = embedding_layer(ref_tokens_masked_tensor, af=ref_af_tensor, pos=True)  # [num_haps, L, D]
-
-                # 4b. Complete版本 (用于返回)
-                ref_tokens_complete_tensor = torch.LongTensor(ref_tokens_complete).to(device)
-                ref_emb_complete = embedding_layer(ref_tokens_complete_tensor, af=ref_af_tensor, pos=True)  # [num_haps, L, D]
 
                 # === 步骤5: 用Masked embeddings构建FAISS索引 ===
                 num_haps, L, D = ref_emb_masked.shape
@@ -205,25 +200,36 @@ class EmbeddingRAGDataset(TrainDataset):
                 # 构建FAISS索引 (基于masked embeddings)
                 index = faiss.IndexFlatL2(L * D)  # L*D维空间
                 index.add(ref_emb_masked_flat_np)
-                self.embedding_indexes.append(index)
 
-                # === 步骤6: 存储embeddings到CPU ===
-                self.ref_embeddings_masked.append(ref_emb_masked.cpu())      # 用于重建索引
-                self.ref_embeddings_complete.append(ref_emb_complete.cpu())  # 用于返回给模型
+                # === 步骤6: 保存FAISS索引到磁盘 (不保存到内存!) ===
+                index_path = os.path.join(self.index_dir, f"index_{w_idx}.faiss")
+                faiss.write_index(index, index_path)
+                self.index_paths.append(index_path)
 
-        # 计算存储大小 (两套embeddings)
-        total_haps = sum(emb.shape[0] for emb in self.ref_embeddings_complete)
-        storage_mb = (total_haps * MAX_SEQ_LEN * self.embed_dim * 4 * 2) / (1024 ** 2)  # float32 * 2 (masked + complete)
+                # 清理GPU内存
+                del ref_tokens_masked_tensor, ref_af_tensor, ref_emb_masked, ref_emb_masked_flat, ref_emb_masked_flat_np, index
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+
+        # 计算存储大小 (只计算内存中的tokens和AF)
+        total_haps = sum(tokens.shape[0] for tokens in self.ref_tokens_complete)
+        tokens_mb = (total_haps * MAX_SEQ_LEN * 8) / (1024 ** 2)  # int64, 8 bytes
+        af_mb = (self.window_count * MAX_SEQ_LEN * 4) / (1024 ** 2)  # float32, 4 bytes
+        memory_mb = tokens_mb + af_mb
+
+        # 计算磁盘占用 (FAISS索引)
+        disk_gb = (total_haps * MAX_SEQ_LEN * self.embed_dim * 4) / (1024 ** 3)  # float32
 
         print()
         print("=" * 80)
-        print(f"✓ 预编码完成!")
+        print(f"✓ 预编码完成! (内存优化版)")
         print(f"  - 窗口数: {self.window_count}")
         print(f"  - 总单体型数: {total_haps}")
         print(f"  - Embedding维度: {self.embed_dim}")
         print(f"  - FAISS索引维度: {MAX_SEQ_LEN * self.embed_dim}")
         print(f"  - Mask版本号: {self.mask_version}")
-        print(f"  - 存储大小: {storage_mb:.1f} MB (两套embeddings, CPU RAM)")
+        print(f"  - 内存占用: {memory_mb:.1f} MB (tokens + AF) ✅")
+        print(f"  - 磁盘占用: {disk_gb:.1f} GB (FAISS索引)")
         print(f"  - 总耗时: {time.time() - start_time:.2f}s")
         print("=" * 80)
 
@@ -254,6 +260,38 @@ class EmbeddingRAGDataset(TrainDataset):
 
         print(f"✓ Mask刷新完成! 新版本: {self.mask_version}")
         print(f"{'='*80}\n")
+
+    def load_index(self, w_idx):
+        """从磁盘加载FAISS索引"""
+        return faiss.read_index(self.index_paths[w_idx])
+
+    def encode_complete_embeddings(self, w_idx, device='cuda'):
+        """
+        按需编码complete embeddings (不预存储)
+
+        Args:
+            w_idx: 窗口索引
+            device: GPU设备
+
+        Returns:
+            ref_emb_complete: [num_haps, L, D] GPU tensor
+        """
+        ref_tokens = self.ref_tokens_complete[w_idx]
+        ref_af = self.ref_af_windows[w_idx]
+
+        # 扩展AF
+        num_haps = ref_tokens.shape[0]
+        ref_af_expanded = np.tile(ref_af, (num_haps, 1))
+
+        # 编码
+        with torch.no_grad():
+            ref_emb = self.embedding_layer(
+                torch.LongTensor(ref_tokens).to(device),
+                af=torch.FloatTensor(ref_af_expanded).to(device),
+                pos=True
+            )
+
+        return ref_emb  # [num_haps, L, D] 在GPU上
 
     def rebuild_indexes(self, embedding_layer, device='cuda'):
         """
@@ -286,51 +324,29 @@ class EmbeddingRAGDataset(TrainDataset):
                 ref_af_tensor = torch.FloatTensor(ref_af_expanded).to(device)
                 ref_emb_masked = embedding_layer(ref_tokens_tensor, af=ref_af_tensor, pos=True)
 
-                # 更新masked embeddings和tokens
-                self.ref_tokens_masked[w_idx] = ref_tokens_masked
-                self.ref_embeddings_masked[w_idx] = ref_emb_masked.cpu()
-
                 # 重建FAISS索引
                 num_haps, L, D = ref_emb_masked.shape
                 ref_emb_flat = ref_emb_masked.reshape(num_haps, L * D)
                 ref_emb_flat_np = ref_emb_flat.cpu().numpy().astype(np.float32)
 
-                self.embedding_indexes[w_idx].reset()
-                self.embedding_indexes[w_idx].add(ref_emb_flat_np)
+                # 构建新索引
+                index = faiss.IndexFlatL2(L * D)
+                index.add(ref_emb_flat_np)
+
+                # 保存到磁盘 (覆盖旧索引)
+                index_path = self.index_paths[w_idx]
+                faiss.write_index(index, index_path)
+
+                # 清理GPU内存
+                del ref_tokens_tensor, ref_af_tensor, ref_emb_masked, ref_emb_flat, ref_emb_flat_np, index
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
 
         print(f"✓ 索引重建完成! 耗时: {time.time() - start_time:.2f}s")
         print(f"{'='*80}\n")
 
-    def refresh_complete_embeddings(self, embedding_layer, device='cuda'):
-        """
-        刷新完整版本的reference embeddings (每个epoch结束后调用)
-
-        关键: 用最新的embedding layer重新编码完整版本
-        这确保返回给模型的embeddings是最新的learned representations
-        """
-        print(f"▣ 刷新Complete Embeddings")
-        start_time = time.time()
-
-        with torch.no_grad():
-            for w_idx in tqdm(range(self.window_count), desc="刷新Complete"):
-                # 获取完整tokens和AF
-                ref_tokens_complete = self.ref_tokens_complete[w_idx]
-                ref_af = self.ref_af_windows[w_idx]
-
-                # 扩展AF
-                num_haps = ref_tokens_complete.shape[0]
-                ref_af_expanded = np.tile(ref_af, (num_haps, 1))
-
-                # 重新编码完整版本
-                ref_tokens_tensor = torch.LongTensor(ref_tokens_complete).to(device)
-                ref_af_tensor = torch.FloatTensor(ref_af_expanded).to(device)
-                ref_emb_complete = embedding_layer(ref_tokens_tensor, af=ref_af_tensor, pos=True)
-
-                # 更新完整embeddings
-                self.ref_embeddings_complete[w_idx] = ref_emb_complete.cpu()
-
-        print(f"✓ Complete刷新完成! 耗时: {time.time() - start_time:.2f}s")
-        print(f"{'='*80}\n")
+    # refresh_complete_embeddings方法已删除
+    # 现在使用encode_complete_embeddings()按需编码，不预存储
 
     def _apply_mask_to_tokens(self, tokens, mask):
         """
@@ -473,30 +489,32 @@ def embedding_rag_collate_fn(batch_list, dataset, embedding_layer, k_retrieve=1)
     # 处理每个窗口
     with torch.no_grad():  # 检索操作不需要梯度
         for win_idx, group in window_groups.items():
-            # 获取FAISS索引 (基于masked embeddings)
-            index = dataset.embedding_indexes[win_idx]
-            # 获取完整embeddings (用于返回给模型)
-            ref_emb_complete = dataset.ref_embeddings_complete[win_idx]  # [num_haps, L, D] (CPU)
+            # 1. 从磁盘加载FAISS索引
+            index = dataset.load_index(win_idx)
 
-            # 批量编码queries (用当前mask, 已在__getitem__中tokenized)
+            # 2. 批量编码queries (用当前mask, 已在__getitem__中tokenized)
             h1_tokens = torch.stack([s['hap_1'] for s in group]).to(device)  # [B, L] (已masked)
             h2_tokens = torch.stack([s['hap_2'] for s in group]).to(device)  # [B, L] (已masked)
             af_batch = torch.stack([s['af'] for s in group]).to(device)  # [B, L]
 
-            # 编码query (masked版本, 与索引语义对齐)
+            # 3. 编码query (masked版本, 与索引语义对齐)
             h1_emb = embedding_layer(h1_tokens, af=af_batch, pos=True)  # [B, L, D]
             h2_emb = embedding_layer(h2_tokens, af=af_batch, pos=True)
 
             B, L, D = h1_emb.shape
 
-            # Flatten并检索 (在masked space检索)
+            # 4. Flatten并检索 (在masked space检索)
             h1_emb_flat = h1_emb.reshape(B, L * D).cpu().numpy().astype(np.float32)
             h2_emb_flat = h2_emb.reshape(B, L * D).cpu().numpy().astype(np.float32)
 
             D1, I1 = index.search(h1_emb_flat, k=k_retrieve)  # [B, k]
             D2, I2 = index.search(h2_emb_flat, k=k_retrieve)
 
-            # 收集retrieved embeddings (返回COMPLETE版本!)
+            # 5. 按需编码complete embeddings (不从内存读取!)
+            ref_emb_complete = dataset.encode_complete_embeddings(win_idx, device=device)
+            # [num_haps, L, D] 在GPU上
+
+            # 6. 收集retrieved embeddings (返回COMPLETE版本!)
             for i, sample in enumerate(group):
                 # h1的top-k (完整embeddings)
                 topk_h1 = []

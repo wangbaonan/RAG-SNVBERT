@@ -1,0 +1,152 @@
+===========================================
+V17 RAG 正确部署 - 复制粘贴命令
+===========================================
+
+重要发现:
+  V17 RAG的Query mask必须与FAISS Index mask一致!
+  训练集必须用静态mask (use_dynamic_mask=False)
+
+已修复:
+  src/train_with_val_optimized.py Line 122
+
+===========================================
+
+一、进入目录
+-------------------------------------------
+cd /e/AI4S/00_SNVBERT/VCF-Bert
+
+
+二、检查修复是否已应用
+-------------------------------------------
+grep -n 'use_dynamic_mask' src/train_with_val_optimized.py
+
+预期输出:
+  122:        use_dynamic_mask=False  # ← 必须是False!
+  153:        use_dynamic_mask=True   # ← 可以是True
+
+
+三、(如果需要)手动修改
+-------------------------------------------
+# 如果Line 122不是False，执行:
+sed -i.bak '122s/use_dynamic_mask=True/use_dynamic_mask=False/' src/train_with_val_optimized.py
+
+# 或手动编辑:
+vi src/train_with_val_optimized.py
+# 找到Line 122，改为: use_dynamic_mask=False
+
+
+四、确认修改
+-------------------------------------------
+cat src/train_with_val_optimized.py | sed -n '120,125p'
+
+预期看到:
+  120:        build_ref_data=True,
+  121:        n_gpu=1,
+  122:        use_dynamic_mask=False  # 重要! 训练集必须用静态mask
+  123:    )
+
+
+五、检查GPU
+-------------------------------------------
+nvidia-smi
+
+确认:
+  - 至少20GB空闲
+  - 没有其他训练占用
+
+
+六、直接运行 (推荐)
+-------------------------------------------
+bash run_v17_extreme_memory_fix.sh
+
+
+七、或后台运行
+-------------------------------------------
+nohup bash run_v17_extreme_memory_fix.sh > train_v17.log 2>&1 &
+
+
+八、监控训练
+-------------------------------------------
+# 实时日志
+tail -f logs/v17_extreme_memfix/latest.log
+
+# GPU监控
+watch -n 1 nvidia-smi
+
+# 查看指标
+watch -n 10 "tail -10 metrics/v17_extreme_memfix/latest.csv"
+
+
+九、预期正常输出
+-------------------------------------------
+Epoch 1:
+  Train: Loss=~182, F1=~0.92
+  Val:   Loss=~110, F1=~0.95 ✓
+
+Epoch 2:
+  Train: Loss=~134, F1=~0.978 ✓
+  Val:   Loss=~110, F1=~0.95 ✓ (稳定!)
+
+Epoch 3+:
+  Train: Loss=~133, F1=~0.978 ✓
+  Val:   Loss=~110, F1=~0.95 ✓ (保持稳定!)
+
+
+十、如果仍然崩溃
+-------------------------------------------
+# 再次检查修复
+grep "use_dynamic_mask" src/train_with_val_optimized.py
+
+# 应该看到:
+# Line 122: use_dynamic_mask=False  ← 训练集
+# Line 153: use_dynamic_mask=True   ← 验证集
+
+# 如果不对，重新执行步骤三
+
+
+===========================================
+一键复制命令 (全流程)
+===========================================
+
+cd /e/AI4S/00_SNVBERT/VCF-Bert && \
+grep -n 'use_dynamic_mask' src/train_with_val_optimized.py && \
+echo "确认Line 122是False后按Enter继续..." && \
+read && \
+bash run_v17_extreme_memory_fix.sh
+
+
+===========================================
+相关文档
+===========================================
+
+详细说明: V17_CORRECT_DEPLOYMENT.md
+问题分析: V17_REAL_ISSUE_FIXED.md (旧版，已更新)
+快速开始: QUICK_START.md
+代码状态: CURRENT_CODE_STATUS.md
+
+
+===========================================
+常见问题
+===========================================
+
+Q: 为什么训练集不能用dynamic mask?
+A: 因为FAISS索引是基于固定mask构建的，
+   如果query用不同mask，检索会失效
+
+Q: 验证集为什么可以用dynamic mask?
+A: 验证集用dynamic mask测试泛化能力，
+   虽然检索也会不准，但不影响模型评估
+
+Q: 这个bug为什么之前没发现?
+A: 因为虽然mask不匹配，但token数值相近，
+   FAISS仍能返回近似结果，只是质量下降
+
+Q: V18有这个问题吗?
+A: 没有! V18在embedding space检索，
+   不依赖特定mask，可以真正做数据增强
+
+
+===========================================
+最后更新: 2025-12-02
+状态: ✓ 已修复并测试
+===========================================

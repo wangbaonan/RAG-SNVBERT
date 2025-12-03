@@ -297,17 +297,11 @@ def main():
         else:
             trainer.save(epoch, args.output_path)
 
-        # === 关键修改2: Epoch结束后刷新完整embeddings ===
-        # 用最新模型重新编码完整版本的reference embeddings
-        # 这确保下个epoch返回给模型的embeddings是最新的
-        print(f"\n{'='*80}")
-        print(f"▣ Epoch {epoch+1}: 刷新Complete Embeddings")
-        print(f"{'='*80}")
-        if rag_train_loader:
-            rag_train_loader.refresh_complete_embeddings(embedding_layer, device=device)
-        if rag_val_loader:
-            rag_val_loader.refresh_complete_embeddings(embedding_layer, device=device)
-        print(f"✓ Complete Embeddings刷新完成!\n")
+        # === 修改: refresh_complete_embeddings已删除 ===
+        # 现在使用按需编码，不预存储complete embeddings
+        # 每个batch在collate_fn中调用encode_complete_embeddings()
+        # 这样既节省内存，又确保使用最新模型
+        pass  # 不需要额外操作
 
         # 增加难度 (Curriculum Learning)
         if rag_train_loader:
