@@ -59,6 +59,7 @@ class EmbeddingRAGDataset(TrainDataset):
         self.window_masks = []            # 填充后的mask
         self.mask_version = 0             # 当前mask版本号
         self.ref_af_windows = []          # AF信息 [window_idx][L]
+        self.window_actual_lens = []      # 每个窗口过滤后的实际长度 [window_idx]
 
         # 存储embedding layer引用 (用于刷新)
         self.embedding_layer = embedding_layer
@@ -130,6 +131,9 @@ class EmbeddingRAGDataset(TrainDataset):
                     train_pos = train_pos[valid_pos_mask]
                     # 更新window_len为过滤后的长度
                     window_len = len(train_pos)
+
+                # 保存每个窗口的实际长度 (用于regenerate_masks)
+                self.window_actual_lens.append(window_len)
 
                 # === 步骤2: 生成mask (用于语义对齐) ===
                 # 现在基于过滤后的window_len生成mask
@@ -236,8 +240,8 @@ class EmbeddingRAGDataset(TrainDataset):
         print(f"{'='*80}")
 
         for w_idx in range(self.window_count):
-            window_len = self.window.window_info[w_idx, 1] - \
-                         self.window.window_info[w_idx, 0]
+            # 使用过滤后的实际长度 (不是window.window_info的原始长度!)
+            window_len = self.window_actual_lens[w_idx]
 
             # 生成新mask
             np.random.seed(seed * 10000 + w_idx)
@@ -374,8 +378,8 @@ class EmbeddingRAGDataset(TrainDataset):
 
         # 根据配置选择静态或动态mask
         if self.use_dynamic_mask:
-            window_len = self.window.window_info[window_idx, 1] - \
-                        self.window.window_info[window_idx, 0]
+            # 使用过滤后的实际长度
+            window_len = self.window_actual_lens[window_idx]
 
             old_state = np.random.get_state()
             np.random.seed(self.current_epoch * 10000 + window_idx)
