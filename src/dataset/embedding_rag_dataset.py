@@ -269,6 +269,11 @@ class EmbeddingRAGDataset(TrainDataset):
         """
         按需编码complete embeddings (支持梯度回传)
 
+        ⚠️ DEPRECATED: 此方法会对整个参考面板编码，导致OOM
+        推荐使用 process_batch_retrieval 的 Lazy Encoding 策略
+
+        仅在 rebuild_indexes 中使用（无梯度模式）
+
         Args:
             w_idx: 窗口索引
             device: GPU设备
@@ -305,19 +310,20 @@ class EmbeddingRAGDataset(TrainDataset):
 
     def process_batch_retrieval(self, batch, embedding_layer, device, k_retrieve=1):
         """
-        在主进程中执行RAG检索 (带梯度的端到端学习)
+        在主进程中执行RAG检索 (Lazy Encoding 优化版 - 解决OOM)
 
-        关键改进:
-        1. 在主进程执行，无CUDA fork风险
-        2. Query编码和Reference编码都在计算图中（grad_enabled=True）
-        3. 梯度可以从Reference回传到Embedding层
-        4. 真正实现End-to-End Learnable RAG
+        关键优化:
+        1. **Lazy Encoding**: 先检索，只编码检索到的少量 haplotypes
+        2. 避免对整个参考面板（数千个haplotypes）全量编码
+        3. Query编码和Reference编码都在计算图中（grad_enabled=True）
+        4. 显存占用: O(B*k) 而非 O(num_total_haps)
 
         核心流程:
         1. 编码Query (masked版本, 带梯度)
-        2. 在FAISS中检索最近邻 (masked space, 语义对齐)
-        3. 编码Retrieved Reference (complete版本, 带梯度!)
-        4. 返回带梯度的RAG embeddings
+        2. FAISS检索获取Top-K索引 (不可微)
+        3. **按需提取**: 只从CPU内存提取检索到的 haplotypes 的 tokens
+        4. **按需编码**: 只编码这少量 retrieved tokens (带梯度!)
+        5. 返回带梯度的RAG embeddings
 
         Args:
             batch: CPU batch from DataLoader (dict)
@@ -349,7 +355,7 @@ class EmbeddingRAGDataset(TrainDataset):
         rag_emb_h1_list = []
         rag_emb_h2_list = []
 
-        # 3. 处理每个窗口（带梯度）
+        # 3. 处理每个窗口（Lazy Encoding）
         for win_idx, indices in window_groups.items():
             # 获取当前窗口的样本
             h1_win = h1_tokens[indices]  # [B_win, L]
@@ -362,8 +368,7 @@ class EmbeddingRAGDataset(TrainDataset):
 
             B_win = h1_emb.size(0)
 
-            # === 步骤2: FAISS检索 (在masked space, 但不需要梯度) ===
-            # 注意: FAISS检索本身不可微，但检索结果用于索引Reference
+            # === 步骤2: FAISS检索获取Top-K索引 ===
             with torch.no_grad():
                 # 加载FAISS索引
                 index = self.load_index(win_idx)
@@ -375,26 +380,54 @@ class EmbeddingRAGDataset(TrainDataset):
                 D1, I1 = index.search(h1_emb_flat, k=k_retrieve)  # [B_win, k]
                 D2, I2 = index.search(h2_emb_flat, k=k_retrieve)
 
-            # === 步骤3: 编码Retrieved Reference (带梯度!) ===
-            # 关键: grad_enabled=True，让Reference参与端到端学习
-            ref_emb_complete = self.encode_complete_embeddings(
-                win_idx, device=device, grad_enabled=True
-            )  # [num_haps, L, D] 在GPU上，带梯度!
+            # === 步骤3: 按需提取 - 只取检索到的 haplotypes ===
+            # 获取所有需要的唯一索引
+            unique_indices_h1 = np.unique(I1.flatten())
+            unique_indices_h2 = np.unique(I2.flatten())
+            unique_indices = np.unique(np.concatenate([unique_indices_h1, unique_indices_h2]))
 
-            # === 步骤4: 收集Retrieved Embeddings (保持梯度) ===
+            # 从CPU内存提取对应的 tokens 和 AF
+            ref_tokens_complete = self.ref_tokens_complete[win_idx]  # [num_haps, L]
+            ref_af = self.ref_af_windows[win_idx]  # [L]
+
+            # 只提取需要的 haplotypes
+            retrieved_tokens = ref_tokens_complete[unique_indices]  # [num_retrieved, L]
+            num_retrieved = retrieved_tokens.shape[0]
+
+            # 扩展AF（每个haplotype共享相同的AF）
+            retrieved_af = np.tile(ref_af, (num_retrieved, 1))  # [num_retrieved, L]
+
+            # === 步骤4: 按需编码 - 只编码检索到的 (带梯度!) ===
+            # 转为GPU tensor并编码
+            retrieved_tokens_tensor = torch.LongTensor(retrieved_tokens).to(device)
+            retrieved_af_tensor = torch.FloatTensor(retrieved_af).to(device)
+
+            # 关键: 不使用 torch.no_grad()，保持梯度
+            retrieved_emb = embedding_layer(
+                retrieved_tokens_tensor,
+                af=retrieved_af_tensor,
+                pos=True
+            )  # [num_retrieved, L, D] 带梯度!
+
+            # 创建索引映射: old_index -> new_index
+            index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(unique_indices)}
+
+            # === 步骤5: 收集Retrieved Embeddings (保持梯度) ===
             for i in range(B_win):
                 # h1的top-k
                 topk_h1 = []
                 for k in range(k_retrieve):
-                    ref_idx = I1[i, k]
-                    topk_h1.append(ref_emb_complete[ref_idx])  # [L, D] 带梯度!
+                    old_ref_idx = I1[i, k]
+                    new_ref_idx = index_map[old_ref_idx]
+                    topk_h1.append(retrieved_emb[new_ref_idx])  # [L, D] 带梯度!
                 rag_emb_h1_list.append(torch.stack(topk_h1))  # [k, L, D]
 
                 # h2的top-k
                 topk_h2 = []
                 for k in range(k_retrieve):
-                    ref_idx = I2[i, k]
-                    topk_h2.append(ref_emb_complete[ref_idx])  # [L, D] 带梯度!
+                    old_ref_idx = I2[i, k]
+                    new_ref_idx = index_map[old_ref_idx]
+                    topk_h2.append(retrieved_emb[new_ref_idx])  # [L, D] 带梯度!
                 rag_emb_h2_list.append(torch.stack(topk_h2))  # [k, L, D]
 
         # 4. 堆叠为batch (保持梯度)

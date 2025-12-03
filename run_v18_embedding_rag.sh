@@ -49,15 +49,15 @@ echo "  - V18: 115 ms/batch"
 echo "  - Speedup: 1.8x"
 echo ""
 echo "Model Architecture:"
-echo "  - Dims: 192"
-echo "  - Layers: 10"
-echo "  - Heads: 6"
-echo "  - Params: ~8M"
+echo "  - Dims: 384 (upgraded for better capacity)"
+echo "  - Layers: 12"
+echo "  - Heads: 12"
+echo "  - Params: ~32M"
 echo ""
 echo "Training Config:"
-echo "  - Batch size: 32 (2x larger than V17)"
+echo "  - Batch size: 24 (optimized for 384 dims)"
 echo "  - Grad accum: 2 steps"
-echo "  - Effective batch: 64"
+echo "  - Effective batch: 48"
 echo "  - LR: 7.5e-5"
 echo "  - Warmup: 15k steps"
 echo ""
@@ -89,11 +89,11 @@ python -m src.train_embedding_rag \
     \
     --output_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag/rag_bert.model \
     \
-    --dims 192 \
-    --layers 10 \
-    --attn_heads 6 \
-    --train_batch_size 32 \
-    --val_batch_size 64 \
+    --dims 384 \
+    --layers 12 \
+    --attn_heads 12 \
+    --train_batch_size 24 \
+    --val_batch_size 48 \
     --epochs 20 \
     --cuda_devices 0 \
     --log_freq 500 \
