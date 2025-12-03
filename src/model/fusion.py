@@ -316,11 +316,20 @@ class PositionFeatModule(nn.Module):
     
     def forward(self, pos : torch.Tensor):
         # pos.shape == (batch, seq_len)
-        out = pos.unsqueeze(1)
-        out = self.norm1(self.act1(self.conv1(out)))
-        out = self.norm2(self.act2(self.conv2(out)))
-        out = self.act3(self.conv3(out))
-        return out.squeeze()
+        # 修复说明: 强制禁用 autocast 并使用 FP32 运行 Conv1d
+        # 原因: 规避 V18 中因非连续张量输入导致的 CUDNN_STATUS_NOT_SUPPORTED 报错及性能崩塌
+        # 背景: A100/H100 GPU 在混合精度训练时，CuDNN 对 FP16 卷积输入的内存布局极其敏感
+        #      当输入张量内存不连续（Stride 不规整）时，CuDNN 无法生成高效执行计划
+        #      导致回退到未优化的慢速内核（85s/it → <1s/it）
+        with torch.cuda.amp.autocast(enabled=False):
+            # 确保输入是连续的 float32
+            out = pos.float().unsqueeze(1)
+
+            out = self.norm1(self.act1(self.conv1(out)))
+            out = self.norm2(self.act2(self.conv2(out)))
+            out = self.act3(self.conv3(out))
+
+            return out.squeeze()
 
 
 

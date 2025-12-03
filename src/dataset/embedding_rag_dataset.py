@@ -431,8 +431,11 @@ class EmbeddingRAGDataset(TrainDataset):
                 rag_emb_h2_list.append(torch.stack(topk_h2))  # [k, L, D]
 
         # 4. 堆叠为batch (保持梯度)
-        batch['rag_emb_h1'] = torch.stack(rag_emb_h1_list)  # [B, k, L, D]
-        batch['rag_emb_h2'] = torch.stack(rag_emb_h2_list)
+        # 性能优化: 显式调用 .contiguous() 确保内存连续性
+        # 原因: torch.stack() 可能产生非连续张量，导致后续 GPU 操作性能下降
+        #      特别是在混合精度训练中，非连续的 FP16 张量会触发 CuDNN 报错
+        batch['rag_emb_h1'] = torch.stack(rag_emb_h1_list).contiguous()  # [B, k, L, D]
+        batch['rag_emb_h2'] = torch.stack(rag_emb_h2_list).contiguous()
 
         return batch
 
