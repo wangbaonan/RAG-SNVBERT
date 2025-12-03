@@ -118,7 +118,8 @@ def main():
         args.pos_path,
         args.refpanel_path,
         build_ref_data=True,
-        n_gpu=1
+        n_gpu=1,
+        use_dynamic_mask=False  # 重要! 训练集必须用静态mask (与FAISS索引一致!)
     )
 
     train_dataloader = DataLoader(
