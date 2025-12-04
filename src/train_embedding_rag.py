@@ -69,6 +69,10 @@ def main():
     parser.add_argument("--cuda_devices", type=int, default=0, help="GPU设备")
     parser.add_argument("--num_workers", type=int, default=4, help="数据加载worker数 (重构后支持多worker)")
 
+    # Checkpoint恢复参数
+    parser.add_argument("--resume_path", type=str, default=None, help="恢复训练的checkpoint路径")
+    parser.add_argument("--resume_epoch", type=int, default=0, help="恢复的起始epoch (用于课程学习)")
+
     # 输出参数
     parser.add_argument("--output_path", required=True, type=str, help="模型保存路径")
     parser.add_argument("--log_freq", type=int, default=500, help="日志打印频率")
@@ -146,6 +150,37 @@ def main():
     # === 关键: 获取embedding layer用于预编码 ===
     embedding_layer = bert_model.embedding
     print(f"✓ Embedding layer obtained for pre-encoding")
+
+    # === Checkpoint恢复: 加载预训练权重 ===
+    start_epoch = 0
+    if args.resume_path:
+        print(f"\n{'='*80}")
+        print(f"Resuming from Checkpoint...")
+        print(f"{'='*80}")
+        print(f"Loading weights from: {args.resume_path}")
+
+        checkpoint = torch.load(args.resume_path, map_location=device)
+
+        # 处理DataParallel保存的模型 (键名带 'module.' 前缀)
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+
+        # 移除 'module.' 前缀 (如果存在)
+        from collections import OrderedDict
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            name = k[7:] if k.startswith('module.') else k  # 移除 'module.' 前缀
+            new_state_dict[name] = v
+
+        model.load_state_dict(new_state_dict)
+        print(f"✓ Weights loaded successfully")
+
+        # 设置起始epoch
+        start_epoch = args.resume_epoch
+        print(f"✓ Resuming from epoch {start_epoch}")
+        print(f"{'='*80}\n")
 
     # 加载训练数据 (使用EmbeddingRAGDataset)
     print(f"\n{'='*80}")
@@ -225,6 +260,17 @@ def main():
         print(f"✓ Validation dataset: {len(rag_val_loader)} samples, {len(val_dataloader)} batches")
         print(f"✓ Using WindowGroupedSampler for validation (shuffle=False)")
 
+        # === 关键修改: 固定验证集难度为50% (level=4) ===
+        # 验证集不参与课程学习，保持固定难度以便公平比较不同epoch的性能
+        print(f"\n{'='*80}")
+        print(f"Setting Validation Mask Level to 50%...")
+        print(f"{'='*80}")
+        for _ in range(4):  # 从level=0提升到level=4 (50% mask)
+            rag_val_loader.add_level()
+        print(f"✓ Validation mask level set to 50%")
+        print(f"✓ Validation difficulty is now FIXED for all epochs")
+        print(f"{'='*80}\n")
+
     # 创建trainer
     print(f"\n{'='*80}")
     print(f"Initializing Trainer...")
@@ -257,12 +303,25 @@ def main():
     trainer.embedding_layer = embedding_layer
     trainer.rag_k = args.rag_k
 
+    # === 关键修改: 恢复训练时，同步训练集的mask level ===
+    if start_epoch > 0 and rag_train_loader:
+        print(f"\n{'='*80}")
+        print(f"Restoring Training Mask Level for Epoch {start_epoch}...")
+        print(f"{'='*80}")
+        # 课程学习策略: 每2个epoch增加一次难度
+        target_level = min(start_epoch // 2, 7)  # level最大为7 (80% mask)
+        for _ in range(target_level):
+            rag_train_loader.add_level()
+        current_mask_rate = rag_train_loader._BaseDataset__mask_rate[rag_train_loader._BaseDataset__level]
+        print(f"✓ Training mask level restored to: {current_mask_rate*100:.0f}%")
+        print(f"{'='*80}\n")
+
     # 训练循环
     print(f"\n{'='*80}")
     print(f"Starting Training...")
     print(f"{'='*80}\n")
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"\n{'='*80}")
         print(f"Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*80}")
@@ -317,11 +376,26 @@ def main():
         # 这样既节省内存，又确保使用最新模型
         pass  # 不需要额外操作
 
-        # 增加难度 (Curriculum Learning)
-        if rag_train_loader:
-            rag_train_loader.add_level()
-        if rag_val_loader:
-            rag_val_loader.add_level()
+        # === 关键修改: 课程学习策略优化 ===
+        # 1. 训练集: 每2个epoch增加一次难度 (给模型更多时间收敛)
+        # 2. 验证集: 固定50%难度，不再增加 (保持评估标准一致)
+        if (epoch + 1) % 2 == 0 and rag_train_loader:
+            # 只在偶数epoch增加训练难度
+            current_level = rag_train_loader._BaseDataset__level
+            max_level = len(rag_train_loader._BaseDataset__mask_rate) - 1
+
+            if current_level < max_level:
+                rag_train_loader.add_level()
+                new_mask_rate = rag_train_loader._BaseDataset__mask_rate[rag_train_loader._BaseDataset__level]
+                print(f"\n{'='*80}")
+                print(f"▣ Curriculum Learning: Training Mask Rate → {new_mask_rate*100:.0f}%")
+                print(f"{'='*80}\n")
+            else:
+                print(f"\n▣ Curriculum Learning: Maximum mask rate reached (80%)")
+
+        # 验证集保持固定难度 (50%)
+        # ❌ 已禁用: rag_val_loader.add_level()
+        # 原因: 验证集必须在整个训练过程中保持固定难度，以便Loss和F1在不同epoch间可比较
 
     print(f"\n{'='*80}")
     print(f"Training Completed!")

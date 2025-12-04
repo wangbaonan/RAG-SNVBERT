@@ -1,22 +1,12 @@
 #!/bin/bash
 
 # ==========================================
-# v18: Embedding RAG (端到端可学习)
-# Version: v18-embedding-rag
+# v18: Embedding RAG - Resume from Epoch 2
 #
-# 核心改进:
-# 1. 检索在embedding space进行 (端到端可学习!)
-# 2. Reference embeddings每个epoch刷新 (保持最新)
-# 3. 内存优化: 10GB vs 19GB (减少47%)
-# 4. 速度提升: 1.8x faster
-# 5. 可以用更大的batch size: 32 vs 16
-#
-# 预期效果:
-# - 内存: ~12GB per batch (vs 19GB in V17)
-# - Batch size: 32 (vs 16 in V17)
-# - 等效batch: 64 (grad_accum=2)
-# - 速度: 2倍于V17
-# - 检索质量: 更好 (learned embedding space)
+# 关键改进:
+# 1. 从 Epoch 2 checkpoint 恢复训练
+# 2. 验证集固定在 50% mask (不再增加)
+# 3. 训练集每 2 个 epoch 增加难度 (课程学习)
 # ==========================================
 
 # 创建日志和数据目录
@@ -27,39 +17,26 @@ mkdir -p ${METRICS_DIR}
 
 # 生成带时间戳的文件名
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="${LOG_DIR}/training_${TIMESTAMP}.log"
-METRICS_CSV="${METRICS_DIR}/metrics_${TIMESTAMP}.csv"
+LOG_FILE="${LOG_DIR}/training_resume_ep2_${TIMESTAMP}.log"
+METRICS_CSV="${METRICS_DIR}/metrics_resume_ep2_${TIMESTAMP}.csv"
+
+# === Checkpoint路径配置 ===
+RESUME_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag/rag_bert.model.ep2"
+RESUME_EPOCH=2
 
 echo "================================================"
-echo "V18: Embedding RAG (End-to-End Learnable)"
+echo "V18: Embedding RAG - Resume from Epoch 2"
 echo "================================================"
-echo "Key Innovations:"
-echo "  - Retrieval in learned embedding space"
-echo "  - Reference embeddings refreshed every epoch"
-echo "  - Only pass Transformer ONCE (not twice)"
+echo "Resume Configuration:"
+echo "  - Checkpoint: ${RESUME_PATH}"
+echo "  - Starting Epoch: ${RESUME_EPOCH}"
+echo "  - Training Mask: 10% (will increase to 20% at epoch 4)"
+echo "  - Validation Mask: 50% (FIXED)"
 echo ""
-echo "Memory Optimization:"
-echo "  - V17: 19 GB per batch (batch=16)"
-echo "  - V18: 12 GB per batch (batch=32)"
-echo "  - Reduction: 47%"
-echo ""
-echo "Speed Improvement:"
-echo "  - V17: 210 ms/batch"
-echo "  - V18: 115 ms/batch"
-echo "  - Speedup: 1.8x"
-echo ""
-echo "Model Architecture:"
-echo "  - Dims: 384 (upgraded for better capacity)"
-echo "  - Layers: 12"
-echo "  - Heads: 12"
-echo "  - Params: ~32M"
-echo ""
-echo "Training Config:"
-echo "  - Batch size: 24 (optimized for 384 dims)"
-echo "  - Grad accum: 2 steps"
-echo "  - Effective batch: 48"
-echo "  - LR: 7.5e-5"
-echo "  - Warmup: 15k steps"
+echo "Key Changes:"
+echo "  - Validation difficulty is now FIXED at 50%"
+echo "  - Training difficulty increases every 2 epochs"
+echo "  - Loss curves are now comparable across epochs"
 echo ""
 echo "Output:"
 echo "  - Log: ${LOG_FILE}"
@@ -72,15 +49,17 @@ echo "GPU Status before training:"
 nvidia-smi
 echo ""
 
-# === Checkpoint恢复配置 (可选) ===
-# 如果需要从checkpoint恢复训练，请取消注释以下两行并修改路径
-# RESUME_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag/rag_bert.model.ep2"
-# RESUME_EPOCH=2
-# 然后在下方python命令中添加:
-#     --resume_path ${RESUME_PATH} \
-#     --resume_epoch ${RESUME_EPOCH} \
+# 检查checkpoint是否存在
+if [ ! -f "${RESUME_PATH}" ]; then
+    echo "❌ ERROR: Checkpoint not found at ${RESUME_PATH}"
+    echo "Please check the path and try again."
+    exit 1
+fi
 
-# 运行训练
+echo "✓ Checkpoint found, starting resume training..."
+echo ""
+
+# 运行训练 (从 Epoch 2 恢复)
 python -m src.train_embedding_rag \
     --train_dataset /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/data/train_val_split/train_split.h5 \
     --train_panel /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/data/train_val_split/train_panel.txt \
@@ -121,11 +100,14 @@ python -m src.train_embedding_rag \
     \
     --rare_threshold 0.05 \
     --metrics_csv ${METRICS_CSV} \
+    \
+    --resume_path ${RESUME_PATH} \
+    --resume_epoch ${RESUME_EPOCH} \
     2>&1 | tee ${LOG_FILE}
 
 echo ""
 echo "================================================"
-echo "Training finished"
+echo "Resume Training finished"
 echo "================================================"
 echo "Log saved to: ${LOG_FILE}"
 echo "Metrics CSV saved to: ${METRICS_CSV}"
@@ -135,17 +117,16 @@ nvidia-smi
 echo ""
 
 # 创建符号链接
-ln -sf ${LOG_FILE} ${LOG_DIR}/latest.log
-ln -sf ${METRICS_CSV} ${METRICS_DIR}/latest.csv
+ln -sf ${LOG_FILE} ${LOG_DIR}/latest_resume.log
+ln -sf ${METRICS_CSV} ${METRICS_DIR}/latest_resume.csv
 
 echo "Latest files:"
-echo "  Log: ${LOG_DIR}/latest.log"
-echo "  CSV: ${METRICS_DIR}/latest.csv"
+echo "  Log: ${LOG_DIR}/latest_resume.log"
+echo "  CSV: ${METRICS_DIR}/latest_resume.csv"
 echo ""
-echo "✓ Embedding RAG Training Complete!"
+echo "✓ Resume Training Complete!"
 echo ""
-echo "Key Benefits vs V17:"
-echo "  - 2x faster training (larger batch size)"
-echo "  - 47% less memory"
-echo "  - Better retrieval (learned embedding space)"
-echo "  - End-to-end learnable"
+echo "Key Improvements:"
+echo "  - Validation loss is now comparable across epochs (fixed 50% mask)"
+echo "  - Training difficulty increases gradually (every 2 epochs)"
+echo "  - Model performance can be accurately tracked"
