@@ -209,7 +209,8 @@ def main():
         embedding_layer=embedding_layer,  # 传入embedding layer
         build_ref_data=True,
         n_gpu=1,
-        use_dynamic_mask=True  # V18优势: 支持dynamic mask! 每个epoch索引会刷新
+        use_dynamic_mask=True,  # V18优势: 支持dynamic mask! 每个epoch索引会刷新
+        name='train'  # 关键修复: 指定训练集名称，避免与验证集索引冲突
     )
 
     # === 性能优化: 使用Window-Grouped Sampler (减少磁盘I/O) ===
@@ -250,7 +251,8 @@ def main():
             embedding_layer=embedding_layer,
             build_ref_data=True,
             n_gpu=1,
-            use_dynamic_mask=True
+            use_dynamic_mask=True,
+            name='val'  # 关键修复: 指定验证集名称，使用独立的索引目录
         )
 
         # === 性能优化: 验证集也使用Window-Grouped Sampler ===

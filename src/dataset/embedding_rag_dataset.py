@@ -41,13 +41,15 @@ class EmbeddingRAGDataset(TrainDataset):
                  build_ref_data=True,
                  n_gpu=1,
                  maf_mask_percentage=10,
-                 use_dynamic_mask=False):
+                 use_dynamic_mask=False,
+                 name='default'):
         super().__init__(vocab, vcf, pos, panel, freq, window,
                         type_to_idx, pop_to_idx, pos_to_idx)
 
         self.maf_mask_percentage = maf_mask_percentage
         self.use_dynamic_mask = use_dynamic_mask
         self.current_epoch = 0
+        self.name = name  # 数据集名称 (用于区分训练集/验证集的索引)
 
         # Embedding RAG特有的数据结构
         self.ref_tokens_complete = []     # 完整tokens (无mask) [window_idx][num_haps, L]
@@ -58,7 +60,11 @@ class EmbeddingRAGDataset(TrainDataset):
         self.window_actual_lens = []      # 每个窗口过滤后的实际长度 [window_idx]
 
         # FAISS索引路径 (保存到磁盘)
-        self.index_dir = os.path.join(os.path.dirname(ref_vcf_path) if ref_vcf_path else ".", "faiss_indexes")
+        # 关键修复: 使用 name 参数区分训练集和验证集的索引目录
+        # 训练集: faiss_indexes_train, 验证集: faiss_indexes_val
+        # 避免索引文件冲突导致的语义不匹配问题
+        base_dir = os.path.dirname(ref_vcf_path) if ref_vcf_path else "."
+        self.index_dir = os.path.join(base_dir, f"faiss_indexes_{name}")
         self.index_paths = []             # 索引文件路径
 
         # === 性能优化: 单槽位缓存 (配合Window-Grouped Sampling) ===
@@ -115,6 +121,72 @@ class EmbeddingRAGDataset(TrainDataset):
         # 对每个window进行预编码
         with torch.no_grad():  # 关键: 预编码时不计算梯度
             for w_idx in tqdm(range(self.window_count), desc="预编码窗口"):
+                # === 性能优化: 断点续传 - 跳过已存在的索引文件 ===
+                index_path = os.path.join(self.index_dir, f"index_{w_idx}.faiss")
+
+                if os.path.exists(index_path):
+                    # 索引文件已存在，只需加载CPU端数据（tokens, AF, masks）
+                    # 这些数据在内存中需要，用于 __getitem__ 运行
+                    self.index_paths.append(index_path)
+
+                    # 快速加载CPU端数据（无需GPU推理）
+                    current_slice = slice(
+                        self.window.window_info[w_idx, 0],
+                        self.window.window_info[w_idx, 1]
+                    )
+                    window_len = current_slice.stop - current_slice.start
+
+                    # 处理参考数据以确定有效位点
+                    train_pos = self.pos[current_slice]
+                    ref_indices = []
+                    valid_pos_mask = []
+
+                    for idx, p in enumerate(train_pos):
+                        matches = np.where(ref_pos == p)[0]
+                        if len(matches) > 0:
+                            ref_indices.append(matches[0])
+                            valid_pos_mask.append(idx)
+
+                    if len(ref_indices) < len(train_pos):
+                        if len(valid_pos_mask) == 0:
+                            continue
+                        valid_indices = current_slice.start + np.array(valid_pos_mask)
+                        current_slice = valid_indices
+                        train_pos = train_pos[valid_pos_mask]
+                        window_len = len(train_pos)
+
+                    self.window_actual_lens.append(window_len)
+
+                    # 生成mask
+                    raw_mask = self.generate_mask(window_len)
+                    padded_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
+                    self.raw_window_masks.append(raw_mask)
+                    self.window_masks.append(padded_mask)
+
+                    # 保存complete tokens（用于后续编码）
+                    raw_mask_complete = np.zeros_like(raw_mask)
+                    padded_mask_complete = VCFProcessingModule.sequence_padding(
+                        raw_mask_complete, dtype='int'
+                    )
+                    raw_ref = ref_gt[current_slice, :, :]
+                    raw_ref = raw_ref.reshape(raw_ref.shape[0], -1).T
+                    ref_tokens_complete = self.tokenize(raw_ref, padded_mask_complete)
+                    self.ref_tokens_complete.append(ref_tokens_complete)
+
+                    # 保存AF
+                    AF_IDX = 3
+                    GLOBAL_IDX = 5
+                    ref_af = np.array([
+                        self.freq[AF_IDX][GLOBAL_IDX][self.pos_to_idx[p]]
+                        if p in self.pos_to_idx else 0.0
+                        for p in train_pos
+                    ], dtype=np.float32)
+                    ref_af = VCFProcessingModule.sequence_padding(ref_af, dtype='float')
+                    self.ref_af_windows.append(ref_af)
+
+                    continue  # 跳过GPU编码和索引构建
+
+                # === 正常流程: 索引不存在，需要完整构建 ===
                 current_slice = slice(
                     self.window.window_info[w_idx, 0],
                     self.window.window_info[w_idx, 1]
@@ -639,11 +711,16 @@ class EmbeddingRAGDataset(TrainDataset):
                   embedding_layer=None,
                   build_ref_data=True,
                   n_gpu=1,
-                  use_dynamic_mask=False):
+                  use_dynamic_mask=False,
+                  name='default'):
         """
         从文件创建EmbeddingRAGDataset
 
         重要: 必须提供embedding_layer用于预编码!
+
+        Args:
+            name: 数据集名称 (用于区分训练集/验证集的索引目录)
+                  训练集应使用 'train', 验证集应使用 'val'
         """
         # 调用父类创建基础dataset
         base_dataset = TrainDataset.from_file(
@@ -666,7 +743,8 @@ class EmbeddingRAGDataset(TrainDataset):
             embedding_layer=embedding_layer,
             build_ref_data=build_ref_data,
             n_gpu=n_gpu,
-            use_dynamic_mask=use_dynamic_mask
+            use_dynamic_mask=use_dynamic_mask,
+            name=name  # 传递name参数
         )
         return rag_dataset
 
