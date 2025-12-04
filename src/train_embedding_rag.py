@@ -161,13 +161,22 @@ def main():
 
         checkpoint = torch.load(args.resume_path, map_location=device)
 
-        # 处理DataParallel保存的模型 (键名带 'module.' 前缀)
-        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
+        # 处理不同的checkpoint格式
+        if isinstance(checkpoint, dict):
+            # 格式1: {'state_dict': OrderedDict(...), ...}
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            # 格式2: 直接是 state_dict (OrderedDict)
+            else:
+                state_dict = checkpoint
+        elif hasattr(checkpoint, 'state_dict'):
+            # 格式3: checkpoint 是模型对象本身
+            print(f"✓ Checkpoint is a model object, extracting state_dict...")
+            state_dict = checkpoint.state_dict()
         else:
-            state_dict = checkpoint
+            raise ValueError(f"Unknown checkpoint format: {type(checkpoint)}")
 
-        # 移除 'module.' 前缀 (如果存在)
+        # 移除 'module.' 前缀 (如果存在，DataParallel模型会有这个前缀)
         from collections import OrderedDict
         new_state_dict = OrderedDict()
         for k, v in state_dict.items():
