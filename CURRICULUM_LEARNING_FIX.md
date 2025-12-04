@@ -112,7 +112,7 @@ parser.add_argument("--resume_path", type=str, default=None, help="恢复训练�
 parser.add_argument("--resume_epoch", type=int, default=0, help="恢复的起始epoch (用于课程学习)")
 ```
 
-**加载权重** ([train_embedding_rag.py:154-183](src/train_embedding_rag.py#L154-L183)):
+**加载权重** ([train_embedding_rag.py:154-188](src/train_embedding_rag.py#L154-L188)):
 ```python
 # === Checkpoint恢复: 加载预训练权重 ===
 start_epoch = 0
@@ -124,13 +124,22 @@ if args.resume_path:
 
     checkpoint = torch.load(args.resume_path, map_location=device)
 
-    # 处理DataParallel保存的模型 (键名带 'module.' 前缀)
-    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-        state_dict = checkpoint['state_dict']
+    # 处理不同的checkpoint格式
+    if isinstance(checkpoint, dict):
+        # 格式1: {'state_dict': OrderedDict(...), ...}
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        # 格式2: 直接是 state_dict (OrderedDict)
+        else:
+            state_dict = checkpoint
+    elif hasattr(checkpoint, 'state_dict'):
+        # 格式3: checkpoint 是模型对象本身
+        print(f"✓ Checkpoint is a model object, extracting state_dict...")
+        state_dict = checkpoint.state_dict()
     else:
-        state_dict = checkpoint
+        raise ValueError(f"Unknown checkpoint format: {type(checkpoint)}")
 
-    # 移除 'module.' 前缀 (如果存在)
+    # 移除 'module.' 前缀 (如果存在，DataParallel模型会有这个前缀)
     from collections import OrderedDict
     new_state_dict = OrderedDict()
     for k, v in state_dict.items():
@@ -168,9 +177,15 @@ for epoch in range(start_epoch, args.epochs):  # 从 start_epoch 开始，而不
 ```
 
 **效果**:
-- ✅ 正确加载权重（处理 DataParallel 前缀）
+- ✅ 正确加载权重（支持3种checkpoint格式：字典、OrderedDict、模型对象）
+- ✅ 处理 DataParallel 前缀（自动移除 'module.' 前缀）
 - ✅ 正确恢复 Mask Level（基于课程学习策略）
 - ✅ 从正确的 Epoch 继续训练
+
+**Bug修复记录**:
+- 2025-12-05: 修复了 `AttributeError: 'BERTFoundationModel' object has no attribute 'items'`
+- 原因: 原始代码假设checkpoint一定是字典，但实际可能是模型对象
+- 解决: 添加 `hasattr(checkpoint, 'state_dict')` 检查，通过 `.state_dict()` 方法提取权重
 
 ---
 
