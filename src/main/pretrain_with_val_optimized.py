@@ -158,19 +158,23 @@ class BERTTrainerWithValidationOptimized():
                         total=len(dataloader), bar_format="{l_bar}{r_bar}")
 
         for i, data in data_iter:
-            # === 关键改进: 在主进程执行RAG检索 (带梯度) ===
+            # === 关键改进: 在主进程执行RAG检索 (训练时带梯度，验证时不带) ===
             # 检查是否是Embedding RAG模式 (有rag_train_dataset属性)
             if hasattr(self, 'rag_train_dataset') or hasattr(self, 'rag_val_dataset'):
                 # 选择对应的dataset
                 rag_dataset = self.rag_train_dataset if train else self.rag_val_dataset
                 if rag_dataset is not None and hasattr(self, 'embedding_layer'):
-                    # 调用process_batch_retrieval进行带梯度的检索
-                    data = rag_dataset.process_batch_retrieval(
-                        data,
-                        self.embedding_layer,
-                        self.device,
-                        k_retrieve=getattr(self, 'rag_k', 1)
-                    )
+                    # === 性能优化: 验证时禁用梯度计算 (避免显存泄漏) ===
+                    # 训练模式: 启用梯度 (端到端学习)
+                    # 验证模式: 禁用梯度 (节省显存，加快速度)
+                    context = torch.enable_grad() if train else torch.no_grad()
+                    with context:
+                        data = rag_dataset.process_batch_retrieval(
+                            data,
+                            self.embedding_layer,
+                            self.device,
+                            k_retrieve=getattr(self, 'rag_k', 1)
+                        )
 
             # 准备数据
             gpu_data = {

@@ -209,16 +209,21 @@ def main():
             use_dynamic_mask=True
         )
 
+        # === 性能优化: 验证集也使用Window-Grouped Sampler ===
+        # 避免验证时频繁切换窗口导致的缓存未命中和磁盘颠簸
+        val_sampler = WindowGroupedSampler(rag_val_loader, shuffle=False)  # shuffle=False保证确定性
+
         val_dataloader = DataLoader(
             rag_val_loader,
             batch_size=args.val_batch_size,
             num_workers=args.num_workers,  # 重构后支持多worker
             collate_fn=embedding_rag_collate_fn,  # 简化collate_fn
-            shuffle=False,
+            sampler=val_sampler,  # ✅ 使用Window-Grouped Sampler
             pin_memory=True  # 加速CPU->GPU传输
         )
 
         print(f"✓ Validation dataset: {len(rag_val_loader)} samples, {len(val_dataloader)} batches")
+        print(f"✓ Using WindowGroupedSampler for validation (shuffle=False)")
 
     # 创建trainer
     print(f"\n{'='*80}")
