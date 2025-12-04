@@ -209,7 +209,7 @@ def main():
         embedding_layer=embedding_layer,  # 传入embedding layer
         build_ref_data=True,
         n_gpu=1,
-        use_dynamic_mask=True,  # V18优势: 支持dynamic mask! 每个epoch索引会刷新
+        use_dynamic_mask=False,  # 关键修复: 必须False，确保Query Mask与索引Mask一致
         name='train'  # 关键修复: 指定训练集名称，避免与验证集索引冲突
     )
 
@@ -251,7 +251,7 @@ def main():
             embedding_layer=embedding_layer,
             build_ref_data=True,
             n_gpu=1,
-            use_dynamic_mask=True,
+            use_dynamic_mask=False,  # 关键修复: 必须False，确保Query Mask与索引Mask一致
             name='val'  # 关键修复: 指定验证集名称，使用独立的索引目录
         )
 

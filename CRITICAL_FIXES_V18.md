@@ -160,7 +160,68 @@ maf_data/
 
 ---
 
-### ~~修复 3: 断点续传优化~~ ❌ 已撤回
+### 修复 3: Query-Reference Mask 对齐 🚨 最关键修复
+
+**文件**: `src/train_embedding_rag.py`
+
+**问题**: 开启 `use_dynamic_mask=True` 后，查询样本的 Mask 与 FAISS 索引中的 Mask 不一致，导致检索语义错误。
+
+**根本原因**:
+```python
+# 索引构建时 (初始化):
+raw_mask = self.generate_mask(window_len)  # Mask A
+ref_tokens_masked = self.tokenize(raw_ref, padded_mask)
+ref_emb = embedding_layer(ref_tokens_masked, ...)
+index.add(ref_emb)  # 索引存储的是 Mask A 的 embeddings
+
+# 查询时 (__getitem__):
+if self.use_dynamic_mask:
+    mask = self.generate_mask(actual_len)  # Mask B (不同！)
+query_tokens_masked = self.tokenize(query, mask)  # 使用 Mask B
+```
+
+**结果**: Query Mask B ≠ Reference Mask A → 检索到的参考样本语义不匹配！
+
+**修改前**:
+```python
+rag_train_loader = EmbeddingRAGDataset.from_file(
+    # ...
+    use_dynamic_mask=True,  # ❌ 错误：导致 Query 和 Reference 的 Mask 不一致
+    name='train'
+)
+
+rag_val_loader = EmbeddingRAGDataset.from_file(
+    # ...
+    use_dynamic_mask=True,  # ❌ 错误：导致 Query 和 Reference 的 Mask 不一致
+    name='val'
+)
+```
+
+**修改后**:
+```python
+rag_train_loader = EmbeddingRAGDataset.from_file(
+    # ...
+    use_dynamic_mask=False,  # ✅ 正确：确保 Query Mask 与索引 Mask 一致
+    name='train'
+)
+
+rag_val_loader = EmbeddingRAGDataset.from_file(
+    # ...
+    use_dynamic_mask=False,  # ✅ 正确：确保 Query Mask 与索引 Mask 一致
+    name='val'
+)
+```
+
+**效果**:
+- ✅ Query 的 Mask 与 FAISS 索引的 Mask **完全一致**
+- ✅ 检索到的参考样本语义**正确匹配**
+- ✅ RAG 系统能够正常工作
+
+**重要性**: 🚨 **这是最关键的修复！** 如果不修复，整个 RAG 系统的检索都是错误的。
+
+---
+
+### ~~修复 4: 断点续传优化~~ ❌ 已撤回
 
 **为什么撤回？**
 
@@ -347,16 +408,17 @@ bash run_v18_resume_from_ep1.sh
 **关键改进**:
 1. ✅ **Sampler不再卡顿** - 初始化从20分钟降至< 1秒
 2. ✅ **索引语义正确** - 训练/验证集独立存储
+3. 🚨 **Query-Reference Mask对齐** - 修复了RAG检索语义错误的致命问题
 
 **建议**:
-- 🎯 **从头训练**，确保数据干净
-- 🎯 保留 ep1 checkpoint作为参考，但不要继续使用
+- 🎯 **从头训练**，确保数据干净且RAG检索正确
+- 🎯 保留 ep1 checkpoint作为参考，但不要继续使用（因为使用了错误的 `use_dynamic_mask=True`）
 - 🎯 每次训练启动需要80分钟预编码（无法避免，MASK每次不同）
 
 **预期效果**:
 - 训练Loss和验证Loss曲线平滑可比较
 - F1/Accuracy持续提升
-- 性能比污染版本更好
+- RAG检索语义正确，性能比之前版本大幅改善
 
 ---
 
