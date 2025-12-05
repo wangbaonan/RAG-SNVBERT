@@ -162,38 +162,10 @@ class EmbeddingRAGDataset(TrainDataset):
     
                     # 保存每个窗口的实际长度 (用于regenerate_masks)
                     self.window_actual_lens.append(window_len)
-    
-                    # === 步骤2: 生成mask (用于语义对齐) ===
-                    # 现在基于过滤后的window_len生成mask
-                    raw_mask = self.generate_mask(window_len)
-                    padded_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
-    
-                    # 保存mask用于后续刷新
-                    self.raw_window_masks.append(raw_mask)
-                    self.window_masks.append(padded_mask)
-    
-                    # 创建完整版本的mask (全0, 用于complete版本)
-                    raw_mask_complete = np.zeros_like(raw_mask)
-                    padded_mask_complete = VCFProcessingModule.sequence_padding(
-                        raw_mask_complete, dtype='int'
-                    )
-    
-                    # 获取reference sequences
-                    raw_ref = ref_gt[current_slice, :, :]  # [L, num_samples, 2]
-                    raw_ref = raw_ref.reshape(raw_ref.shape[0], -1)  # [L, num_haps]
-                    raw_ref = raw_ref.T  # [num_haps, L]
-    
-                    # Tokenize两个版本
-                    # 1. Masked版本: 用于检索 (与Query语义对齐)
-                    ref_tokens_masked = self.tokenize(raw_ref, padded_mask)  # [num_haps, MAX_SEQ_LEN]
-    
-                    # 2. Complete版本: 用于按需编码 (提供完整信息)
-                    ref_tokens_complete = self.tokenize(raw_ref, padded_mask_complete)  # [num_haps, MAX_SEQ_LEN]
-                    self.ref_tokens_complete.append(ref_tokens_complete)  # 只保存complete tokens
-    
-                    # === 步骤3: 计算AF (Reference的真实AF) ===
+
+                    # === 步骤2: 计算AF (CRITICAL: 必须在生成Mask之前!) ===
                     # 从reference panel计算每个位点的AF
-                    # 现在train_pos和raw_ref维度已对齐，可以安全计算
+                    # AF计算仅依赖于train_pos，这在循环开头已经过滤好了，因此移动到这里是安全的
                     # AF=3, GLOBAL=5 (constants from dataset.py)
                     AF_IDX = 3
                     GLOBAL_IDX = 5
@@ -203,12 +175,52 @@ class EmbeddingRAGDataset(TrainDataset):
                         if p in self.pos_to_idx else 0.0
                         for p in train_pos
                     ], dtype=np.float32)
-    
+
                     # Padding到MAX_SEQ_LEN
                     ref_af = VCFProcessingModule.sequence_padding(ref_af, dtype='float')  # [MAX_SEQ_LEN]
-    
+
                     # 保存AF信息用于后续刷新
                     self.ref_af_windows.append(ref_af)  # 只保存一份，后续会扩展
+
+                    # === 步骤3: 生成AF-Guided Mask (用于语义对齐) ===
+                    # [CRITICAL OPTIMIZATION] 在初始化时就生成正确的AF-Guided Mask
+                    # 避免在train.py中被迫重新刷新Mask并重建索引（节省40分钟！）
+                    rare_af_threshold = 0.05  # 稀有变异阈值
+                    rare_mask_rate = 0.7      # 稀有位点Mask概率
+                    current_mask_rate = self._TrainDataset__mask_rate[self._TrainDataset__level]  # 通常为0.3
+
+                    # 构建概率图 (基于AF)
+                    # Rare位点 (AF < 0.05): 70% Mask概率
+                    # Ref位点: 使用课程学习的Mask Rate (30%)
+                    af_data_unpadded = ref_af[:window_len]  # 只取有效长度
+                    probs = np.where(af_data_unpadded < rare_af_threshold, rare_mask_rate, current_mask_rate)
+
+                    # 生成AF-Guided Mask
+                    raw_mask = super().generate_mask(window_len, probs=probs)
+                    padded_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
+
+                    # 保存mask用于后续刷新
+                    self.raw_window_masks.append(raw_mask)
+                    self.window_masks.append(padded_mask)
+
+                    # 创建完整版本的mask (全0, 用于complete版本)
+                    raw_mask_complete = np.zeros_like(raw_mask)
+                    padded_mask_complete = VCFProcessingModule.sequence_padding(
+                        raw_mask_complete, dtype='int'
+                    )
+
+                    # 获取reference sequences
+                    raw_ref = ref_gt[current_slice, :, :]  # [L, num_samples, 2]
+                    raw_ref = raw_ref.reshape(raw_ref.shape[0], -1)  # [L, num_haps]
+                    raw_ref = raw_ref.T  # [num_haps, L]
+
+                    # Tokenize两个版本
+                    # 1. Masked版本: 用于检索 (与Query语义对齐)
+                    ref_tokens_masked = self.tokenize(raw_ref, padded_mask)  # [num_haps, MAX_SEQ_LEN]
+
+                    # 2. Complete版本: 用于按需编码 (提供完整信息)
+                    ref_tokens_complete = self.tokenize(raw_ref, padded_mask_complete)  # [num_haps, MAX_SEQ_LEN]
+                    self.ref_tokens_complete.append(ref_tokens_complete)  # 只保存complete tokens
     
                     # 扩展到所有haplotypes (每个haplotype共享相同的AF)
                     num_haps_in_window = ref_tokens_masked.shape[0]
