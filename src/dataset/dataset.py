@@ -262,10 +262,12 @@ class TrainDataset(Dataset):
 
         self.mask_strategy_count = len(list(self.mask_strategy.keys()))
 
-        # [SMART MASKING] 新增策略配置
+        # [DEPRECATED] masking_strategy and smart_mask_params are no longer used
+        # AF-Guided Masking is now handled in EmbeddingRAGDataset.regenerate_masks
+        # Keep these for backward compatibility (ignored by the new system)
         self.masking_strategy = masking_strategy
         if smart_mask_params is None:
-            smart_mask_params = {'alt_mask_rate': 0.7}  # 默认 Alt Mask Rate 为 70%
+            smart_mask_params = {'alt_mask_rate': 0.7}
         self.smart_mask_params = smart_mask_params
 
         # self.data = self.generate_data()
@@ -375,34 +377,30 @@ class TrainDataset(Dataset):
     def generate_mask(self,
                       length : int,
                       mask_ratio : float = None,
-                      content : np.ndarray = None) -> np.ndarray[int]:
-        """Generate span mask, random mask, or smart balanced mask.
+                      probs : np.ndarray = None) -> np.ndarray[int]:
+        """Generate mask based on probability vector or default strategy.
+
+        [AF-GUIDED MASKING] New interface to support AF-based probability maps.
+        This is the ONLY correct way for RAG systems to ensure Query-Reference mask alignment.
 
         Args:
             length: Sequence length
-            mask_ratio: Override default mask ratio (optional)
-            content: Original sequence content for content-aware masking (optional)
+            mask_ratio: Override default mask ratio (optional, used if probs is None)
+            probs: [NEW] Pre-computed probability vector [length] (optional)
+                   If provided, directly sample from this probability distribution.
+                   This ensures Query and Reference use IDENTICAL mask patterns (based on AF).
 
         Return a np.ndarray instance with 1 as mask and 0 as the opposite.
         """
-        # [SMART MASKING] 策略分发
-        if self.masking_strategy == 'random':
-            # 传统随机 Mask（向后兼容）
-            return self.mask_strategy[1](length, self.__mask_rate[self.__level])
+        # [AF-GUIDED MASKING] Priority path: Use pre-computed probability vector
+        if probs is not None:
+            # Vectorized sampling (zero loops, ultra-fast)
+            # This is the CRITICAL path for RAG systems
+            return (np.random.random(length) < probs).astype(int)
 
-        elif self.masking_strategy == 'smart_balanced':
-            # Smart Balanced Mask（内容感知）
-            if content is not None:
-                base_ratio = mask_ratio if mask_ratio is not None else self.__mask_rate[self.__level]
-                return self.smart_balanced_mask(content, base_ratio)
-            else:
-                # 如果没有提供 content，打印警告并回退到 random mask
-                print(f"⚠️  Warning: 'smart_balanced' strategy requires 'content', "
-                      f"falling back to 'random_mask'")
-                return self.mask_strategy[1](length, self.__mask_rate[self.__level])
-
-        else:
-            raise ValueError(f"Unknown masking_strategy: {self.masking_strategy}")
+        # [FALLBACK] Traditional random masking (backward compatible)
+        # Only used when probs is not provided
+        return self.mask_strategy[1](length, self.__mask_rate[self.__level])
 
     
     def span_mask(self,
@@ -449,37 +447,9 @@ class TrainDataset(Dataset):
         return mask
 
 
-    def smart_balanced_mask(self,
-                            content : np.ndarray,
-                            base_ratio : float) -> np.ndarray[int]:
-        """Generate a Smart Balanced mask based on sequence content.
-
-        Strategy:
-            - Ref (0): Mask with base_ratio (e.g., 0.30)
-            - Alt (>0): Mask with fixed alt_mask_rate (default 0.7)
-
-        This forces the model to solve hard samples (Alt variants) while
-        maintaining context anchors (30% unmasked Alt + some unmasked Ref).
-
-        Args:
-            content: Original haplotype sequence (0 or 1)
-            base_ratio: Base mask probability for Ref positions (from curriculum learning)
-
-        Returns:
-            mask: Binary mask array (1=mask, 0=keep)
-        """
-        length = content.shape[0]
-        alt_mask_rate = self.smart_mask_params['alt_mask_rate']
-
-        # [VECTORIZED] 构建概率矩阵（完全无循环）
-        # Ref (0) 位点使用 base_ratio，Alt (>0) 位点使用 alt_mask_rate
-        prob_matrix = np.where(content == 0, base_ratio, alt_mask_rate)
-
-        # [VECTORIZED] 采样 Mask（完全无循环）
-        random_probs = np.random.random(length)
-        mask = (random_probs < prob_matrix).astype(int)
-
-        return mask
+    # [REMOVED] smart_balanced_mask is DEPRECATED and DANGEROUS for RAG systems
+    # Reason: Content-based masking causes Query-Reference mask misalignment
+    # Correct approach: AF-Guided Masking in EmbeddingRAGDataset.regenerate_masks
 
 
     def __getitem__(self, item) -> dict:
@@ -542,21 +512,13 @@ class TrainDataset(Dataset):
         hap_2 = self.vcf[current_slice, sample_idx, 1]
         # hap_2[hap_2 > 0] = 1
 
-        # [SMART MASKING] 数据流调整：先生成 Mask（在 Padding 前），再 Padding
-        # 原因：Padding 的 0 会稀释 Mask 率，必须在原始序列上生成 Mask
+        # Generate mask (before padding to avoid dilution)
+        # Note: For EmbeddingRAGDataset, mask is NOT generated here
+        #       It's pre-generated in regenerate_masks (AF-Guided) and fetched in __getitem__
+        #       This path is only used for non-RAG datasets
+        mask = self.generate_mask(hap_1.shape[0])
 
-        # Step 1: 为 hap1 和 hap2 分别生成独立的 Mask（增强数据多样性）
-        if self.masking_strategy == 'smart_balanced':
-            # Smart Masking: 根据 hap1 和 hap2 的内容生成不同的 Mask
-            mask_hap1 = self.generate_mask(hap_1.shape[0], content=hap_1)
-            mask_hap2 = self.generate_mask(hap_2.shape[0], content=hap_2)
-            # 合并 Mask（取并集，确保至少一个 hap 被 mask）
-            mask = np.maximum(mask_hap1, mask_hap2)
-        else:
-            # 传统 Random Masking: 使用统一的 Mask
-            mask = self.generate_mask(hap_1.shape[0])
-
-        # Step 2: Padding（在生成 Mask 之后）
+        # Padding (after mask generation)
         # 未经过tokenize的就是原始的label 经过填充的自然就是0 后续也不会变化0
         output['hap_1_label'] = VCFProcessingModule.sequence_padding(hap_1, dtype='int')
         output['hap_2_label'] = VCFProcessingModule.sequence_padding(hap_2, dtype='int')

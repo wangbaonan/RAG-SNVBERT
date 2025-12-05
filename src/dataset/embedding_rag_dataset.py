@@ -268,30 +268,59 @@ class EmbeddingRAGDataset(TrainDataset):
 
     def regenerate_masks(self, seed: int):
         """
-        重新生成所有窗口的mask (用于数据增强)
+        [AF-GUIDED MASKING] 重新生成所有窗口的mask (基于 AF，而非样本内容)
+
+        核心逻辑：
+        - Ref 位点 (普通位点): 使用 current_mask_rate (课程学习，从 30% → 80%)
+        - Rare 位点 (AF < 0.05): 强制使用 70% Mask 概率（难样本挖掘）
+
+        这确保：
+        1. Query 和 Reference 使用相同的 Mask 模式（基于 AF，而非样本内容）
+        2. 低 AF 位点被更频繁地 Mask，迫使模型学习稀有变异
+        3. RAG 检索语义空间对齐（Query-Reference Mask 一致）
 
         Args:
-            seed: 随机种子 (通常是epoch number)
+            seed: 随机种子 (通常是 epoch number)
         """
         self.mask_version += 1
         print(f"\n{'='*80}")
-        print(f"▣ 刷新Mask Pattern (版本 {self.mask_version}, Seed={seed})")
+        print(f"▣ [AF-Guided Masking] 刷新 Mask Pattern (版本 {self.mask_version}, Seed={seed})")
+        print(f"{'='*80}")
+
+        # 获取当前课程学习的 Mask Rate
+        current_mask_rate = self._TrainDataset__mask_rate[self._TrainDataset__level]
+        rare_af_threshold = 0.05  # 稀有变异阈值
+        rare_mask_rate = 0.7      # 稀有位点 Mask 概率
+
+        print(f"▣ Curriculum Learning Level: {self._TrainDataset__level}")
+        print(f"  - Ref (普通) Mask Rate: {current_mask_rate:.1%}")
+        print(f"  - Rare (AF < {rare_af_threshold}) Mask Rate: {rare_mask_rate:.1%}")
         print(f"{'='*80}")
 
         for w_idx in range(self.window_count):
-            # 使用过滤后的实际长度 (不是window.window_info的原始长度!)
+            # 使用过滤后的实际长度
             window_len = self.window_actual_lens[w_idx]
 
-            # 生成新mask
+            # [CRITICAL] 获取当前窗口的 AF 数据
+            af_data = self.ref_af_windows[w_idx][:window_len]  # 只取有效长度
+
+            # [AF-GUIDED] 构建概率图 (Probability Map)
+            # Rare 位点 (AF < 0.05): 70% Mask 概率
+            # Ref 位点: 使用课程学习的 Mask Rate
+            probs = np.where(af_data < rare_af_threshold, rare_mask_rate, current_mask_rate)
+
+            # 生成新 Mask (使用概率图)
             np.random.seed(seed * 10000 + w_idx)
-            raw_mask = self.generate_mask(window_len)
+            raw_mask = super().generate_mask(window_len, probs=probs)
             padded_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
 
-            # 更新保存的mask
+            # 更新保存的 Mask
             self.raw_window_masks[w_idx] = raw_mask
             self.window_masks[w_idx] = padded_mask
 
-        print(f"✓ Mask刷新完成! 新版本: {self.mask_version}")
+        print(f"✓ AF-Guided Mask 刷新完成! 新版本: {self.mask_version}")
+        print(f"✓ 稀有位点 (AF < {rare_af_threshold}) 将以 {rare_mask_rate:.1%} 概率被 Mask")
+        print(f"✓ Query 和 Reference 使用相同的 AF-Guided Mask 模式")
         print(f"{'='*80}\n")
 
     def load_index(self, w_idx):
