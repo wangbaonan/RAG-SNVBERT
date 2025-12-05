@@ -119,119 +119,130 @@ class EmbeddingRAGDataset(TrainDataset):
         print(f"✓ Embedding维度: {self.embed_dim}")
         print()
 
-        # 对每个window进行预编码
-        with torch.no_grad():  # 关键: 预编码时不计算梯度
-            for w_idx in tqdm(range(self.window_count), desc="预编码窗口"):
-                current_slice = slice(
-                    self.window.window_info[w_idx, 0],
-                    self.window.window_info[w_idx, 1]
-                )
-                window_len = current_slice.stop - current_slice.start
+        # [CRITICAL FIX] 保存原始状态并切换到 eval 模式
+        # 这确保 Reference Embedding 不含 Dropout 噪声，保证索引构建的确定性
+        was_training = embedding_layer.training
+        embedding_layer.eval()
 
-                # === 步骤1: 先处理参考数据以确定有效位点 ===
-                train_pos = self.pos[current_slice]
-                ref_indices = []
-                valid_pos_mask = []
+        try:
+            # 对每个window进行预编码
+            with torch.no_grad():  # 关键: 预编码时不计算梯度
+                for w_idx in tqdm(range(self.window_count), desc="预编码窗口"):
+                    current_slice = slice(
+                        self.window.window_info[w_idx, 0],
+                        self.window.window_info[w_idx, 1]
+                    )
+                    window_len = current_slice.stop - current_slice.start
+    
+                    # === 步骤1: 先处理参考数据以确定有效位点 ===
+                    train_pos = self.pos[current_slice]
+                    ref_indices = []
+                    valid_pos_mask = []
+    
+                    for idx, p in enumerate(train_pos):
+                        matches = np.where(ref_pos == p)[0]
+                        if len(matches) > 0:
+                            ref_indices.append(matches[0])
+                            valid_pos_mask.append(idx)
+    
+                    # 如果有位点被过滤，更新current_slice和train_pos
+                    if len(ref_indices) < len(train_pos):
+                        if len(valid_pos_mask) == 0:
+                            print(f"  ⚠ 跳过窗口 {w_idx}: 没有可用位点")
+                            continue
+                        # 关键修复: 同时更新current_slice和train_pos
+                        valid_indices = current_slice.start + np.array(valid_pos_mask)
+                        current_slice = valid_indices
+                        train_pos = train_pos[valid_pos_mask]
+                        # 更新window_len为过滤后的长度
+                        window_len = len(train_pos)
+    
+                        # [FIX A] 保存有效位点的索引掩码，用于 __getitem__ 中过滤训练数据
+                        self.window_valid_indices[w_idx] = np.array(valid_pos_mask)
+    
+                    # 保存每个窗口的实际长度 (用于regenerate_masks)
+                    self.window_actual_lens.append(window_len)
+    
+                    # === 步骤2: 生成mask (用于语义对齐) ===
+                    # 现在基于过滤后的window_len生成mask
+                    raw_mask = self.generate_mask(window_len)
+                    padded_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
+    
+                    # 保存mask用于后续刷新
+                    self.raw_window_masks.append(raw_mask)
+                    self.window_masks.append(padded_mask)
+    
+                    # 创建完整版本的mask (全0, 用于complete版本)
+                    raw_mask_complete = np.zeros_like(raw_mask)
+                    padded_mask_complete = VCFProcessingModule.sequence_padding(
+                        raw_mask_complete, dtype='int'
+                    )
+    
+                    # 获取reference sequences
+                    raw_ref = ref_gt[current_slice, :, :]  # [L, num_samples, 2]
+                    raw_ref = raw_ref.reshape(raw_ref.shape[0], -1)  # [L, num_haps]
+                    raw_ref = raw_ref.T  # [num_haps, L]
+    
+                    # Tokenize两个版本
+                    # 1. Masked版本: 用于检索 (与Query语义对齐)
+                    ref_tokens_masked = self.tokenize(raw_ref, padded_mask)  # [num_haps, MAX_SEQ_LEN]
+    
+                    # 2. Complete版本: 用于按需编码 (提供完整信息)
+                    ref_tokens_complete = self.tokenize(raw_ref, padded_mask_complete)  # [num_haps, MAX_SEQ_LEN]
+                    self.ref_tokens_complete.append(ref_tokens_complete)  # 只保存complete tokens
+    
+                    # === 步骤3: 计算AF (Reference的真实AF) ===
+                    # 从reference panel计算每个位点的AF
+                    # 现在train_pos和raw_ref维度已对齐，可以安全计算
+                    # AF=3, GLOBAL=5 (constants from dataset.py)
+                    AF_IDX = 3
+                    GLOBAL_IDX = 5
+                    # 使用列表推导式，类似base dataset的实现
+                    ref_af = np.array([
+                        self.freq[AF_IDX][GLOBAL_IDX][self.pos_to_idx[p]]
+                        if p in self.pos_to_idx else 0.0
+                        for p in train_pos
+                    ], dtype=np.float32)
+    
+                    # Padding到MAX_SEQ_LEN
+                    ref_af = VCFProcessingModule.sequence_padding(ref_af, dtype='float')  # [MAX_SEQ_LEN]
+    
+                    # 保存AF信息用于后续刷新
+                    self.ref_af_windows.append(ref_af)  # 只保存一份，后续会扩展
+    
+                    # 扩展到所有haplotypes (每个haplotype共享相同的AF)
+                    num_haps_in_window = ref_tokens_masked.shape[0]
+                    ref_af_expanded = np.tile(ref_af, (num_haps_in_window, 1))  # [num_haps, MAX_SEQ_LEN]
+    
+                    # === 步骤4: 编码masked版本并构建FAISS索引 ===
+                    # 只编码masked版本 (用于构建索引)
+                    ref_tokens_masked_tensor = torch.LongTensor(ref_tokens_masked).to(device)
+                    ref_af_tensor = torch.FloatTensor(ref_af_expanded).to(device)
+                    ref_emb_masked = embedding_layer(ref_tokens_masked_tensor, af=ref_af_tensor, pos=True)  # [num_haps, L, D]
+    
+                    # === 步骤5: 用Masked embeddings构建FAISS索引 ===
+                    num_haps, L, D = ref_emb_masked.shape
+                    ref_emb_masked_flat = ref_emb_masked.reshape(num_haps, L * D)  # [num_haps, L*D]
+                    ref_emb_masked_flat_np = ref_emb_masked_flat.cpu().numpy().astype(np.float32)
+    
+                    # 构建FAISS索引 (基于masked embeddings)
+                    index = faiss.IndexFlatL2(L * D)  # L*D维空间
+                    index.add(ref_emb_masked_flat_np)
+    
+                    # === 步骤6: 保存FAISS索引到磁盘 ===
+                    index_path = os.path.join(self.index_dir, f"index_{w_idx}.faiss")
+                    faiss.write_index(index, index_path)
+                    self.index_paths.append(index_path)
+    
+                    # 清理GPU和CPU内存 (不保存索引到内存)
+                    del ref_tokens_masked_tensor, ref_af_tensor, ref_emb_masked, ref_emb_masked_flat, ref_emb_masked_flat_np, index
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
 
-                for idx, p in enumerate(train_pos):
-                    matches = np.where(ref_pos == p)[0]
-                    if len(matches) > 0:
-                        ref_indices.append(matches[0])
-                        valid_pos_mask.append(idx)
-
-                # 如果有位点被过滤，更新current_slice和train_pos
-                if len(ref_indices) < len(train_pos):
-                    if len(valid_pos_mask) == 0:
-                        print(f"  ⚠ 跳过窗口 {w_idx}: 没有可用位点")
-                        continue
-                    # 关键修复: 同时更新current_slice和train_pos
-                    valid_indices = current_slice.start + np.array(valid_pos_mask)
-                    current_slice = valid_indices
-                    train_pos = train_pos[valid_pos_mask]
-                    # 更新window_len为过滤后的长度
-                    window_len = len(train_pos)
-
-                    # [FIX A] 保存有效位点的索引掩码，用于 __getitem__ 中过滤训练数据
-                    self.window_valid_indices[w_idx] = np.array(valid_pos_mask)
-
-                # 保存每个窗口的实际长度 (用于regenerate_masks)
-                self.window_actual_lens.append(window_len)
-
-                # === 步骤2: 生成mask (用于语义对齐) ===
-                # 现在基于过滤后的window_len生成mask
-                raw_mask = self.generate_mask(window_len)
-                padded_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
-
-                # 保存mask用于后续刷新
-                self.raw_window_masks.append(raw_mask)
-                self.window_masks.append(padded_mask)
-
-                # 创建完整版本的mask (全0, 用于complete版本)
-                raw_mask_complete = np.zeros_like(raw_mask)
-                padded_mask_complete = VCFProcessingModule.sequence_padding(
-                    raw_mask_complete, dtype='int'
-                )
-
-                # 获取reference sequences
-                raw_ref = ref_gt[current_slice, :, :]  # [L, num_samples, 2]
-                raw_ref = raw_ref.reshape(raw_ref.shape[0], -1)  # [L, num_haps]
-                raw_ref = raw_ref.T  # [num_haps, L]
-
-                # Tokenize两个版本
-                # 1. Masked版本: 用于检索 (与Query语义对齐)
-                ref_tokens_masked = self.tokenize(raw_ref, padded_mask)  # [num_haps, MAX_SEQ_LEN]
-
-                # 2. Complete版本: 用于按需编码 (提供完整信息)
-                ref_tokens_complete = self.tokenize(raw_ref, padded_mask_complete)  # [num_haps, MAX_SEQ_LEN]
-                self.ref_tokens_complete.append(ref_tokens_complete)  # 只保存complete tokens
-
-                # === 步骤3: 计算AF (Reference的真实AF) ===
-                # 从reference panel计算每个位点的AF
-                # 现在train_pos和raw_ref维度已对齐，可以安全计算
-                # AF=3, GLOBAL=5 (constants from dataset.py)
-                AF_IDX = 3
-                GLOBAL_IDX = 5
-                # 使用列表推导式，类似base dataset的实现
-                ref_af = np.array([
-                    self.freq[AF_IDX][GLOBAL_IDX][self.pos_to_idx[p]]
-                    if p in self.pos_to_idx else 0.0
-                    for p in train_pos
-                ], dtype=np.float32)
-
-                # Padding到MAX_SEQ_LEN
-                ref_af = VCFProcessingModule.sequence_padding(ref_af, dtype='float')  # [MAX_SEQ_LEN]
-
-                # 保存AF信息用于后续刷新
-                self.ref_af_windows.append(ref_af)  # 只保存一份，后续会扩展
-
-                # 扩展到所有haplotypes (每个haplotype共享相同的AF)
-                num_haps_in_window = ref_tokens_masked.shape[0]
-                ref_af_expanded = np.tile(ref_af, (num_haps_in_window, 1))  # [num_haps, MAX_SEQ_LEN]
-
-                # === 步骤4: 编码masked版本并构建FAISS索引 ===
-                # 只编码masked版本 (用于构建索引)
-                ref_tokens_masked_tensor = torch.LongTensor(ref_tokens_masked).to(device)
-                ref_af_tensor = torch.FloatTensor(ref_af_expanded).to(device)
-                ref_emb_masked = embedding_layer(ref_tokens_masked_tensor, af=ref_af_tensor, pos=True)  # [num_haps, L, D]
-
-                # === 步骤5: 用Masked embeddings构建FAISS索引 ===
-                num_haps, L, D = ref_emb_masked.shape
-                ref_emb_masked_flat = ref_emb_masked.reshape(num_haps, L * D)  # [num_haps, L*D]
-                ref_emb_masked_flat_np = ref_emb_masked_flat.cpu().numpy().astype(np.float32)
-
-                # 构建FAISS索引 (基于masked embeddings)
-                index = faiss.IndexFlatL2(L * D)  # L*D维空间
-                index.add(ref_emb_masked_flat_np)
-
-                # === 步骤6: 保存FAISS索引到磁盘 ===
-                index_path = os.path.join(self.index_dir, f"index_{w_idx}.faiss")
-                faiss.write_index(index, index_path)
-                self.index_paths.append(index_path)
-
-                # 清理GPU和CPU内存 (不保存索引到内存)
-                del ref_tokens_masked_tensor, ref_af_tensor, ref_emb_masked, ref_emb_masked_flat, ref_emb_masked_flat_np, index
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
+        finally:
+            # [CRITICAL FIX] 无论是否出错，都恢复原始训练状态
+            # 这确保不会影响后续的训练过程
+            embedding_layer.train(was_training)
 
         # 计算存储大小 (只计算内存中的tokens和AF)
         total_haps = sum(tokens.shape[0] for tokens in self.ref_tokens_complete)
@@ -515,49 +526,63 @@ class EmbeddingRAGDataset(TrainDataset):
         print(f"▣ 重建FAISS索引 (基于新Mask)")
         start_time = time.time()
 
-        with torch.no_grad():
-            for w_idx in tqdm(range(self.window_count), desc="重建索引"):
-                # 获取完整tokens和AF
-                ref_tokens_complete = self.ref_tokens_complete[w_idx]  # [num_haps, L]
-                ref_af = self.ref_af_windows[w_idx]  # [L]
-                current_mask = self.window_masks[w_idx]  # [L]
+        # [CRITICAL FIX] 保存原始状态并切换到 eval 模式
+        # 这确保 Reference Embedding 不含 Dropout 噪声，保证索引构建的确定性
+        # 原因：如果 embedding_layer 处于 training 模式，Dropout 会随机丢弃神经元
+        #      导致同一个 Reference 在不同时刻生成的 Embedding 不一致
+        #      严重影响 RAG 检索的稳定性和准确性
+        was_training = embedding_layer.training
+        embedding_layer.eval()
 
-                # 应用当前mask到完整tokens
-                ref_tokens_masked = self._apply_mask_to_tokens(ref_tokens_complete, current_mask)
+        try:
+            with torch.no_grad():
+                for w_idx in tqdm(range(self.window_count), desc="重建索引"):
+                    # 获取完整tokens和AF
+                    ref_tokens_complete = self.ref_tokens_complete[w_idx]  # [num_haps, L]
+                    ref_af = self.ref_af_windows[w_idx]  # [L]
+                    current_mask = self.window_masks[w_idx]  # [L]
 
-                # 扩展AF
-                num_haps = ref_tokens_masked.shape[0]
-                ref_af_expanded = np.tile(ref_af, (num_haps, 1))
+                    # 应用当前mask到完整tokens
+                    ref_tokens_masked = self._apply_mask_to_tokens(ref_tokens_complete, current_mask)
 
-                # 用masked tokens编码
-                ref_tokens_tensor = torch.LongTensor(ref_tokens_masked).to(device)
-                ref_af_tensor = torch.FloatTensor(ref_af_expanded).to(device)
-                ref_emb_masked = embedding_layer(ref_tokens_tensor, af=ref_af_tensor, pos=True)
+                    # 扩展AF
+                    num_haps = ref_tokens_masked.shape[0]
+                    ref_af_expanded = np.tile(ref_af, (num_haps, 1))
 
-                # 重建FAISS索引
-                num_haps, L, D = ref_emb_masked.shape
-                ref_emb_flat = ref_emb_masked.reshape(num_haps, L * D)
-                ref_emb_flat_np = ref_emb_flat.cpu().numpy().astype(np.float32)
+                    # 用masked tokens编码
+                    ref_tokens_tensor = torch.LongTensor(ref_tokens_masked).to(device)
+                    ref_af_tensor = torch.FloatTensor(ref_af_expanded).to(device)
+                    ref_emb_masked = embedding_layer(ref_tokens_tensor, af=ref_af_tensor, pos=True)
 
-                # 构建新索引
-                index = faiss.IndexFlatL2(L * D)
-                index.add(ref_emb_flat_np)
+                    # 重建FAISS索引
+                    num_haps, L, D = ref_emb_masked.shape
+                    ref_emb_flat = ref_emb_masked.reshape(num_haps, L * D)
+                    ref_emb_flat_np = ref_emb_flat.cpu().numpy().astype(np.float32)
 
-                # 保存到磁盘 (覆盖旧索引)
-                index_path = self.index_paths[w_idx]
-                faiss.write_index(index, index_path)
+                    # 构建新索引
+                    index = faiss.IndexFlatL2(L * D)
+                    index.add(ref_emb_flat_np)
 
-                # 清理单槽位缓存 (如果缓存的正好是这个窗口)
-                if self.cached_window_idx == w_idx:
-                    if self.cached_index is not None:
-                        del self.cached_index
-                    self.cached_index = None
-                    self.cached_window_idx = -1
+                    # 保存到磁盘 (覆盖旧索引)
+                    index_path = self.index_paths[w_idx]
+                    faiss.write_index(index, index_path)
 
-                # 清理GPU和CPU内存
-                del ref_tokens_tensor, ref_af_tensor, ref_emb_masked, ref_emb_flat, ref_emb_flat_np, index
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
+                    # 清理单槽位缓存 (如果缓存的正好是这个窗口)
+                    if self.cached_window_idx == w_idx:
+                        if self.cached_index is not None:
+                            del self.cached_index
+                        self.cached_index = None
+                        self.cached_window_idx = -1
+
+                    # 清理GPU和CPU内存
+                    del ref_tokens_tensor, ref_af_tensor, ref_emb_masked, ref_emb_flat, ref_emb_flat_np, index
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+
+        finally:
+            # [CRITICAL FIX] 无论是否出错，都恢复原始训练状态
+            # 这确保不会影响后续的训练过程
+            embedding_layer.train(was_training)
 
         print(f"✓ 索引重建完成! 耗时: {time.time() - start_time:.2f}s")
         print(f"{'='*80}\n")
