@@ -605,7 +605,14 @@ class EmbeddingRAGDataset(TrainDataset):
 
     def __getitem__(self, item) -> dict:
         output = super().__getitem__(item)
-        window_idx = item % self.window_count
+
+        # [BEST PRACTICE FIX] 优先从父类输出获取 window_idx，确保与父类逻辑解耦
+        # 这遵循"单一事实来源"原则，避免硬编码计算逻辑
+        if 'window_idx' in output:
+            window_idx = int(output['window_idx'])
+        else:
+            # 回退逻辑：保持与父类逻辑一致 (Sample-Major)
+            window_idx = item % self.window_count
 
         # [FIX A] 如果该窗口有位点过滤，先过滤所有序列数据
         if window_idx in self.window_valid_indices:

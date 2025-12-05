@@ -360,19 +360,30 @@ def main():
             print(f"▣ Epoch {epoch}: 刷新Mask和索引 (数据增强)")
             print(f"{'='*80}")
 
-            # 1. 重新生成mask pattern
+            # 1. 重新生成mask pattern（仅训练集）
             if rag_train_loader:
                 rag_train_loader.regenerate_masks(seed=epoch)
-            if rag_val_loader:
-                rag_val_loader.regenerate_masks(seed=epoch)
+                print(f"✓ 训练集 Mask 已刷新（数据增强）")
+
+            # [VALIDATION STRATEGY FIX] 验证集 Mask 必须固定，严禁刷新！
+            # 原因：
+            # - 验证集 Mask（题目）变化会导致 Loss 不可比，干扰 Early Stopping
+            # - 验证集应评估"模型在固定任务上的表现"，而非"模型对新任务的泛化"
+            # if rag_val_loader:
+            #     rag_val_loader.regenerate_masks(seed=epoch)  # ← 已禁用！保持题目固定
+            print(f"✓ 验证集 Mask 保持固定（50%），确保评估基准一致")
 
             # 2. 用新mask和最新模型重建FAISS索引
             if rag_train_loader:
                 rag_train_loader.rebuild_indexes(embedding_layer, device=device)
-            if rag_val_loader:
-                rag_val_loader.rebuild_indexes(embedding_layer, device=device)
+                print(f"✓ 训练集索引已重建（匹配最新 Embedding）")
 
-            print(f"✓ Mask和索引刷新完成!\n")
+            if rag_val_loader:
+                # 验证集索引必须更新（答案随 Embedding Layer 变化）
+                rag_val_loader.rebuild_indexes(embedding_layer, device=device)
+                print(f"✓ 验证集索引已重建（答案更新，题目不变）")
+
+            print(f"\n✓ Mask 和索引刷新完成!\n")
 
         # 训练
         train_metrics = trainer.train(epoch)
