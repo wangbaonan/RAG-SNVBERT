@@ -278,6 +278,12 @@ def main():
         print(f"{'='*80}")
         for _ in range(4):  # 从level=0提升到level=4 (50% mask)
             rag_val_loader.add_level()
+
+        # [FIX] 立即刷新 Mask 和索引，确保 Epoch 1 即为 50% 难度，与后续 Epoch 保持一致
+        print(f"Applying 50% mask immediately for consistency...")
+        rag_val_loader.regenerate_masks(seed=2024)  # 使用固定种子确保可复现
+        rag_val_loader.rebuild_indexes(embedding_layer, device=device)
+
         print(f"✓ Validation mask level set to 50%")
         print(f"✓ Validation difficulty is now FIXED for all epochs")
         print(f"{'='*80}\n")
@@ -392,12 +398,12 @@ def main():
         # 2. 验证集: 固定50%难度，不再增加 (保持评估标准一致)
         if (epoch + 1) % 2 == 0 and rag_train_loader:
             # 只在偶数epoch增加训练难度
-            current_level = rag_train_loader._BaseDataset__level
-            max_level = len(rag_train_loader._BaseDataset__mask_rate) - 1
+            current_level = rag_train_loader._TrainDataset__level
+            max_level = len(rag_train_loader._TrainDataset__mask_rate) - 1
 
             if current_level < max_level:
                 rag_train_loader.add_level()
-                new_mask_rate = rag_train_loader._BaseDataset__mask_rate[rag_train_loader._BaseDataset__level]
+                new_mask_rate = rag_train_loader._TrainDataset__mask_rate[rag_train_loader._TrainDataset__level]
                 print(f"\n{'='*80}")
                 print(f"▣ Curriculum Learning: Training Mask Rate → {new_mask_rate*100:.0f}%")
                 print(f"{'='*80}\n")
