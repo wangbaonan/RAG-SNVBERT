@@ -343,6 +343,11 @@ def main():
         print(f"Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*80}")
 
+        # [FIX C] 更新Sampler的随机种子，确保每个epoch的batch顺序不同
+        if hasattr(train_dataloader, 'sampler') and hasattr(train_dataloader.sampler, 'set_epoch'):
+            train_dataloader.sampler.set_epoch(epoch)
+            print(f"✓ Train sampler epoch set to {epoch}")
+
         # 更新epoch计数器
         if rag_train_loader:
             rag_train_loader.current_epoch = epoch

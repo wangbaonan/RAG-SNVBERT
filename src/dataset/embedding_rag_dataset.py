@@ -57,6 +57,7 @@ class EmbeddingRAGDataset(TrainDataset):
         self.window_masks = []            # 填充后的mask
         self.mask_version = 0             # 当前mask版本号
         self.ref_af_windows = []          # AF信息 [window_idx][L]
+        self.window_valid_indices = {}    # [FIX] 记录每个窗口的有效位点索引 (用于过滤训练数据)
         self.window_actual_lens = []      # 每个窗口过滤后的实际长度 [window_idx]
 
         # FAISS索引路径 (保存到磁盘)
@@ -149,6 +150,9 @@ class EmbeddingRAGDataset(TrainDataset):
                     train_pos = train_pos[valid_pos_mask]
                     # 更新window_len为过滤后的长度
                     window_len = len(train_pos)
+
+                    # [FIX A] 保存有效位点的索引掩码，用于 __getitem__ 中过滤训练数据
+                    self.window_valid_indices[w_idx] = np.array(valid_pos_mask)
 
                 # 保存每个窗口的实际长度 (用于regenerate_masks)
                 self.window_actual_lens.append(window_len)
@@ -411,9 +415,9 @@ class EmbeddingRAGDataset(TrainDataset):
         L = h1_tokens.size(1)
         D = self.embed_dim
 
-        # 使用list存储，最后stack
-        rag_emb_h1_list = []
-        rag_emb_h2_list = []
+        # [FIX B] 预分配Tensor，避免顺序错乱
+        rag_emb_h1_final = torch.zeros(B, k_retrieve, L, D, device=device, dtype=h1_tokens.dtype)
+        rag_emb_h2_final = torch.zeros(B, k_retrieve, L, D, device=device, dtype=h2_tokens.dtype)
 
         # 3. 处理每个窗口（Lazy Encoding）
         for win_idx, indices in window_groups.items():
@@ -473,29 +477,27 @@ class EmbeddingRAGDataset(TrainDataset):
             index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(unique_indices)}
 
             # === 步骤5: 收集Retrieved Embeddings (保持梯度) ===
+            # [FIX B] 使用索引赋值，保持正确顺序
+            idx_tensor = torch.tensor(indices, device=device)
+
             for i in range(B_win):
+                batch_idx = idx_tensor[i]  # 全局batch中的索引
+
                 # h1的top-k
-                topk_h1 = []
                 for k in range(k_retrieve):
                     old_ref_idx = I1[i, k]
                     new_ref_idx = index_map[old_ref_idx]
-                    topk_h1.append(retrieved_emb[new_ref_idx])  # [L, D] 带梯度!
-                rag_emb_h1_list.append(torch.stack(topk_h1))  # [k, L, D]
+                    rag_emb_h1_final[batch_idx, k] = retrieved_emb[new_ref_idx]  # [L, D] 带梯度!
 
                 # h2的top-k
-                topk_h2 = []
                 for k in range(k_retrieve):
                     old_ref_idx = I2[i, k]
                     new_ref_idx = index_map[old_ref_idx]
-                    topk_h2.append(retrieved_emb[new_ref_idx])  # [L, D] 带梯度!
-                rag_emb_h2_list.append(torch.stack(topk_h2))  # [k, L, D]
+                    rag_emb_h2_final[batch_idx, k] = retrieved_emb[new_ref_idx]  # [L, D] 带梯度!
 
-        # 4. 堆叠为batch (保持梯度)
-        # 性能优化: 显式调用 .contiguous() 确保内存连续性
-        # 原因: torch.stack() 可能产生非连续张量，导致后续 GPU 操作性能下降
-        #      特别是在混合精度训练中，非连续的 FP16 张量会触发 CuDNN 报错
-        batch['rag_emb_h1'] = torch.stack(rag_emb_h1_list).contiguous()  # [B, k, L, D]
-        batch['rag_emb_h2'] = torch.stack(rag_emb_h2_list).contiguous()
+        # 4. 赋值到batch (保持梯度和正确顺序)
+        batch['rag_emb_h1'] = rag_emb_h1_final.contiguous()  # [B, k, L, D]
+        batch['rag_emb_h2'] = rag_emb_h2_final.contiguous()
 
         return batch
 
@@ -604,6 +606,18 @@ class EmbeddingRAGDataset(TrainDataset):
     def __getitem__(self, item) -> dict:
         output = super().__getitem__(item)
         window_idx = item % self.window_count
+
+        # [FIX A] 如果该窗口有位点过滤，先过滤所有序列数据
+        if window_idx in self.window_valid_indices:
+            valid_mask = self.window_valid_indices[window_idx]
+            # 过滤序列数据（hap1_nomask, hap2_nomask, label）
+            output['hap1_nomask'] = output['hap1_nomask'][valid_mask]
+            output['hap2_nomask'] = output['hap2_nomask'][valid_mask]
+            output['label'] = output['label'][valid_mask]
+            # 过滤 float fields（af, type, pop 等）
+            for key in self.float_fields:
+                if key in output and len(output[key]) > len(valid_mask):
+                    output[key] = output[key][valid_mask]
 
         # 根据配置选择静态或动态mask
         if self.use_dynamic_mask:
