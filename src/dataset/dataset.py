@@ -203,7 +203,7 @@ class TrainDataset(Dataset):
         >>> 2
 
     """
-    def __init__(self, 
+    def __init__(self,
                  vocab : WordVocab,
                  vcf : np.ndarray,
                  pos : np.ndarray,
@@ -212,9 +212,11 @@ class TrainDataset(Dataset):
                  window : Window,
                  type_to_idx : dict[str, int],
                  pop_to_idx : dict[str, int],
-                 pos_to_idx : dict[int, int]
+                 pos_to_idx : dict[int, int],
+                 masking_strategy : str = 'random',
+                 smart_mask_params : dict = None
                  ):
-        
+
         self.vocab = vocab
 
         self.vcf = vcf
@@ -245,7 +247,9 @@ class TrainDataset(Dataset):
         # Keys should be transferred into FloatType when sampling.
         self.float_fields = ['pos', 'af', 'af_p', 'ref', 'het', 'hom']
 
-        self.__mask_rate : list[float] = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
+        # [SMART MASKING] 调整课程学习起点为 30%
+        # 原理：从更高的基础难度开始，避免模型在低 mask 率下学会"偷懒"
+        self.__mask_rate : list[float] = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80]
 
         self.__level : int = 0
 
@@ -257,6 +261,12 @@ class TrainDataset(Dataset):
         }
 
         self.mask_strategy_count = len(list(self.mask_strategy.keys()))
+
+        # [SMART MASKING] 新增策略配置
+        self.masking_strategy = masking_strategy
+        if smart_mask_params is None:
+            smart_mask_params = {'alt_mask_rate': 0.7}  # 默认 Alt Mask Rate 为 70%
+        self.smart_mask_params = smart_mask_params
 
         # self.data = self.generate_data()
 
@@ -364,22 +374,35 @@ class TrainDataset(Dataset):
     
     def generate_mask(self,
                       length : int,
-                      mask_ratio : float = None) -> np.ndarray[int]:
-        """Generate span mask or random mask. 
-        
+                      mask_ratio : float = None,
+                      content : np.ndarray = None) -> np.ndarray[int]:
+        """Generate span mask, random mask, or smart balanced mask.
+
+        Args:
+            length: Sequence length
+            mask_ratio: Override default mask ratio (optional)
+            content: Original sequence content for content-aware masking (optional)
+
         Return a np.ndarray instance with 1 as mask and 0 as the opposite.
         """
-        # Randomly pick a method.
-        # strategy_idx = np.random.randint(0, self.mask_strategy_count)
+        # [SMART MASKING] 策略分发
+        if self.masking_strategy == 'random':
+            # 传统随机 Mask（向后兼容）
+            return self.mask_strategy[1](length, self.__mask_rate[self.__level])
 
-        # Cancel the following comment if SET MASK RATIO.
-        # if mask_ratio is None:
-        #     mask_ratio = self.__mask_rate[self.__level]
+        elif self.masking_strategy == 'smart_balanced':
+            # Smart Balanced Mask（内容感知）
+            if content is not None:
+                base_ratio = mask_ratio if mask_ratio is not None else self.__mask_rate[self.__level]
+                return self.smart_balanced_mask(content, base_ratio)
+            else:
+                # 如果没有提供 content，打印警告并回退到 random mask
+                print(f"⚠️  Warning: 'smart_balanced' strategy requires 'content', "
+                      f"falling back to 'random_mask'")
+                return self.mask_strategy[1](length, self.__mask_rate[self.__level])
 
-        # return self.mask_strategy[strategy_idx](length, mask_ratio)
-    
-        # return self.mask_strategy[strategy_idx](length, self.__mask_rate[self.__level])
-        return self.mask_strategy[1](length, self.__mask_rate[self.__level])
+        else:
+            raise ValueError(f"Unknown masking_strategy: {self.masking_strategy}")
 
     
     def span_mask(self,
@@ -422,6 +445,39 @@ class TrainDataset(Dataset):
 
             if prob < mask_ratio:
                 mask[i] = 1
+
+        return mask
+
+
+    def smart_balanced_mask(self,
+                            content : np.ndarray,
+                            base_ratio : float) -> np.ndarray[int]:
+        """Generate a Smart Balanced mask based on sequence content.
+
+        Strategy:
+            - Ref (0): Mask with base_ratio (e.g., 0.30)
+            - Alt (>0): Mask with fixed alt_mask_rate (default 0.7)
+
+        This forces the model to solve hard samples (Alt variants) while
+        maintaining context anchors (30% unmasked Alt + some unmasked Ref).
+
+        Args:
+            content: Original haplotype sequence (0 or 1)
+            base_ratio: Base mask probability for Ref positions (from curriculum learning)
+
+        Returns:
+            mask: Binary mask array (1=mask, 0=keep)
+        """
+        length = content.shape[0]
+        alt_mask_rate = self.smart_mask_params['alt_mask_rate']
+
+        # [VECTORIZED] 构建概率矩阵（完全无循环）
+        # Ref (0) 位点使用 base_ratio，Alt (>0) 位点使用 alt_mask_rate
+        prob_matrix = np.where(content == 0, base_ratio, alt_mask_rate)
+
+        # [VECTORIZED] 采样 Mask（完全无循环）
+        random_probs = np.random.random(length)
+        mask = (random_probs < prob_matrix).astype(int)
 
         return mask
 
@@ -485,6 +541,22 @@ class TrainDataset(Dataset):
         # hap_1[hap_1 > 0] = 1
         hap_2 = self.vcf[current_slice, sample_idx, 1]
         # hap_2[hap_2 > 0] = 1
+
+        # [SMART MASKING] 数据流调整：先生成 Mask（在 Padding 前），再 Padding
+        # 原因：Padding 的 0 会稀释 Mask 率，必须在原始序列上生成 Mask
+
+        # Step 1: 为 hap1 和 hap2 分别生成独立的 Mask（增强数据多样性）
+        if self.masking_strategy == 'smart_balanced':
+            # Smart Masking: 根据 hap1 和 hap2 的内容生成不同的 Mask
+            mask_hap1 = self.generate_mask(hap_1.shape[0], content=hap_1)
+            mask_hap2 = self.generate_mask(hap_2.shape[0], content=hap_2)
+            # 合并 Mask（取并集，确保至少一个 hap 被 mask）
+            mask = np.maximum(mask_hap1, mask_hap2)
+        else:
+            # 传统 Random Masking: 使用统一的 Mask
+            mask = self.generate_mask(hap_1.shape[0])
+
+        # Step 2: Padding（在生成 Mask 之后）
         # 未经过tokenize的就是原始的label 经过填充的自然就是0 后续也不会变化0
         output['hap_1_label'] = VCFProcessingModule.sequence_padding(hap_1, dtype='int')
         output['hap_2_label'] = VCFProcessingModule.sequence_padding(hap_2, dtype='int')
@@ -493,16 +565,15 @@ class TrainDataset(Dataset):
         gt_label = (hap_1 << 1) + hap_2
         output['gt_label'] = VCFProcessingModule.sequence_padding(gt_label, dtype='int')
 
-        # Generate a mask sequence.
-        mask = self.generate_mask(gt_label.shape[0])
+        # Mask Padding
         mask = VCFProcessingModule.sequence_padding(mask, dtype='int')
         output['mask'] = mask
 
-        # 新添加没有mask的原始hap_1,hap_2
+        # 新添加没有mask的原始hap_1,hap_2（保存原始值，供 RAG 使用）
         output['hap1_nomask'] = hap_1
         output['hap2_nomask'] = hap_2
-        
-        # Generate training sample.
+
+        # Step 3: Tokenize（应用 Mask）
         hap_1 = self.tokenize(hap_1, mask)
         hap_2 = self.tokenize(hap_2, mask)
 
