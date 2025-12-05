@@ -416,8 +416,10 @@ class EmbeddingRAGDataset(TrainDataset):
         D = self.embed_dim
 
         # [FIX B] 预分配Tensor，避免顺序错乱
-        rag_emb_h1_final = torch.zeros(B, k_retrieve, L, D, device=device, dtype=h1_tokens.dtype)
-        rag_emb_h2_final = torch.zeros(B, k_retrieve, L, D, device=device, dtype=h2_tokens.dtype)
+        # [CRITICAL FIX] 必须使用 float32，而非 h1_tokens.dtype (int64)
+        # 原因: Embedding 输出是浮点数，使用 int64 会导致精度丢失和梯度断裂
+        rag_emb_h1_final = torch.zeros(B, k_retrieve, L, D, device=device, dtype=torch.float32)
+        rag_emb_h2_final = torch.zeros(B, k_retrieve, L, D, device=device, dtype=torch.float32)
 
         # 3. 处理每个窗口（Lazy Encoding）
         for win_idx, indices in window_groups.items():
