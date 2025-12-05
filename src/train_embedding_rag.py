@@ -329,7 +329,7 @@ def main():
         target_level = min(start_epoch // 2, 7)  # level最大为7 (80% mask)
         for _ in range(target_level):
             rag_train_loader.add_level()
-        current_mask_rate = rag_train_loader._BaseDataset__mask_rate[rag_train_loader._BaseDataset__level]
+        current_mask_rate = rag_train_loader._TrainDataset__mask_rate[rag_train_loader._TrainDataset__level]
         print(f"✓ Training mask level restored to: {current_mask_rate*100:.0f}%")
         print(f"{'='*80}\n")
 
