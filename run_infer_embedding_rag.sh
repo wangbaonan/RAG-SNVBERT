@@ -28,25 +28,27 @@ echo "================================================"
 CHECK_POINT="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag/rag_bert.model.ep11"
 
 # === 模型架构参数 (必须与训练时一致!) ===
-DIMS=384         # Hidden dimension (must match training)
-LAYERS=6         # Number of layers (must match training)
-HEADS=8          # Attention heads (must match training)
+# 根据 run_v18_embedding_rag.sh 中的训练参数
+DIMS=384         # Hidden dimension (from training)
+LAYERS=12        # Number of layers (from training) ← 修正为 12
+HEADS=12         # Attention heads (from training) ← 修正为 12
 
 # === 数据路径 ===
 # Reference Panel (用于构建 FAISS 索引)
-REF_PANEL="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/data/train_val_split/train_split.h5"
-REF_PANEL_INFO="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/data/train_val_split/train_panel.txt"
+# 使用训练集作为 Reference Panel
+REF_PANEL="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/data/train_val_split/train_split.h5"
+REF_PANEL_INFO="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/data/train_val_split/train_panel.txt"
 
 # Target Dataset (待填补的数据)
-# 注意: 这里需要指定实际的待填补数据文件
-TARGET_DATASET="/path/to/your/target/data.h5"  # TODO: 修改为实际路径
-TARGET_PANEL="/path/to/your/target/panel.txt"  # TODO: 修改为实际路径
+# 支持 VCF 和 H5 格式
+TARGET_DATASET="/path/to/your/target/data.vcf.gz"  # TODO: 修改为实际路径（VCF 或 H5）
+TARGET_PANEL="/path/to/your/target/panel.txt"      # TODO: 修改为实际路径
 
-# Frequency and mapping files
+# Frequency and mapping files (从训练脚本获取正确路径)
 FREQ_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/maf_data/Freq.npy"
-TYPE_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/data/type_to_idx.txt"
-POP_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/data/pop_to_idx.txt"
-POS_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/data/pos_to_idx.txt"
+TYPE_PATH="data/type_to_idx.bin"  # 修正路径（相对路径，从项目根目录）
+POP_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/maf_data/pop_to_idx.bin"
+POS_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/maf_data/pos_to_idx.bin"
 
 # === 输出路径 ===
 OUTPUT_DIR="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/infer_output_v18"

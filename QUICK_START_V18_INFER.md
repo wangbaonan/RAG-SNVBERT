@@ -31,12 +31,13 @@ vim run_infer_embedding_rag.sh
 CHECK_POINT="/cpfs01/.../rag_bert.model.ep11"  # ← 修改这里
 
 # 2. 模型架构参数（必须与训练一致！）
-DIMS=384         # ← 确认训练时的值
-LAYERS=6         # ← 确认训练时的值
-HEADS=8          # ← 确认训练时的值
+DIMS=384         # ← 已根据训练脚本修正
+LAYERS=12        # ← 已根据训练脚本修正（不是 6！）
+HEADS=12         # ← 已根据训练脚本修正（不是 8！）
 
 # 3. Target Dataset（待填补的数据）
-TARGET_DATASET="/path/to/your/target.h5"        # ← 修改这里
+# 支持 VCF 和 H5 格式
+TARGET_DATASET="/path/to/your/target.vcf.gz"   # ← 修改这里（VCF 或 H5）
 TARGET_PANEL="/path/to/your/target_panel.txt"  # ← 修改这里
 
 # 4. Reference Panel（已提供，通常无需修改）
