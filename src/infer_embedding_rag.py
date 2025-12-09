@@ -120,13 +120,20 @@ def infer():
 
     # 加载 checkpoint
     print(f"  - Loading checkpoint: {args.check_point}")
-    state_dict = torch.load(args.check_point, map_location=device)
+    checkpoint = torch.load(args.check_point, map_location=device)
 
-    # 处理 module. 前缀
-    if any(k.startswith('module.') for k in state_dict.keys()):
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    # 检查 checkpoint 类型
+    if isinstance(checkpoint, dict):
+        # 如果是 state_dict
+        print(f"  - Loading from state_dict...")
+        if any(k.startswith('module.') for k in checkpoint.keys()):
+            checkpoint = {k.replace('module.', ''): v for k, v in checkpoint.items()}
+        model.load_state_dict(checkpoint, strict=False)
+    else:
+        # 如果是整个模型对象
+        print(f"  - Loading from model object...")
+        model = checkpoint
 
-    model.load_state_dict(state_dict, strict=False)
     model.to(device)
     model.eval()
     print(f"✓ Model loaded successfully")
