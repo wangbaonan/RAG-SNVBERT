@@ -308,6 +308,7 @@ class EmbeddingRAGInferDataset(InferDataset):
         # 使用 Imputation Mask
         current_mask = self.infer_masks[window_idx]
         output['mask'] = current_mask
+        output['window_idx'] = window_idx  # 确保添加到输出中
 
         # Tokenize (应用 Imputation Mask)
         output['hap_1'] = self.tokenize(output['hap1_nomask'], current_mask)
