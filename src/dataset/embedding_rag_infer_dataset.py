@@ -46,7 +46,7 @@ class EmbeddingRAGInferDataset(InferDataset):
 
         # Embedding layer (用于构建索引)
         self.embedding_layer = embedding_layer
-        self.embed_dim = embedding_layer.token.embedding_dim if embedding_layer else 384
+        self.embed_dim = embedding_layer.embed_size if embedding_layer else 384
 
         # RAG 相关属性
         self.ref_tokens_complete = []    # Complete Reference Tokens (Value)
