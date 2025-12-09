@@ -35,9 +35,8 @@ HEADS=12         # Attention heads (from training) ← 修正为 12
 
 # === 数据路径 ===
 # Reference Panel (用于构建 FAISS 索引)
-# 使用训练集作为 Reference Panel
-REF_PANEL="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/data/train_val_split/train_split.h5"
-REF_PANEL_INFO="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/data/train_val_split/train_panel.txt"
+# 必须与训练时的 --refpanel_path 一致！
+REF_PANEL="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/maf_data/KGP.chr21.Panel.maf01.vcf.gz"
 
 # Target Dataset (待填补的数据)
 # 支持 VCF 和 H5 格式
