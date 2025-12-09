@@ -316,7 +316,7 @@ def infer():
     print(f"  - Average time per batch: {inference_time / len(infer_data_loader):.2f}s")
     print(f"  - Performance gain: ~{43.0 / (inference_time / len(infer_data_loader)):.1f}x vs Sample-Major baseline")
 
-    # === Step 6: VCF 生成 (Window-Major 数据重排) ===
+    # === Step 6: VCF 生成 (Window-Major → Genomic-Position-Major) ===
     print("\n▣ Step 6: Generating Imputed VCF (Reordering from Window-Major)")
     print(f"  - Concatenating inference results...")
 
@@ -326,96 +326,94 @@ def infer():
     arr_gt_wm = np.concatenate(all_gt_probs, axis=0)       # [N_total, L, 4]
     arr_mask_wm = np.concatenate(all_masks, axis=0)        # [N_total, L]
 
-    print(f"  - Total samples (Window-Major): {arr_hap1_wm.shape[0]}")
-    print(f"  - Sequence length: {arr_hap1_wm.shape[1]}")
+    print(f"  - Total inference results (Window-Major): {arr_hap1_wm.shape[0]}")
+    print(f"  - Sequence length per window: {arr_hap1_wm.shape[1]}")
 
-    # 2. Reshape & Transpose: Window-Major → Sample-Major
-    # 数学变换:
-    # Window-Major: [W0S0, W0S1, ..., W0Sn, W1S0, W1S1, ..., W1Sn, ...]
-    # → Reshape: [Num_Windows, Samples_Per_Window, L]
-    # → Transpose: [Samples_Per_Window, Num_Windows, L]
-    # → Flatten: [S0W0, S0W1, ..., S0Wm, S1W0, S1W1, ...]
+    # 2. Reshape & Transpose: Window-Major → Genomic-Position-Major
+    # 关键数学变换 (正确版):
+    # 目标: 沿基因组位置堆叠窗口，得到 [Total_Variants, Num_Samples]
+    #
+    # Window-Major 输入: [W0S0, W0S1, ..., W0Sn, W1S0, W1S1, ..., W1Sn, ...]
+    #   Shape: [W * S, L] 其中 W=窗口数, S=每窗口样本数, L=窗口长度
+    #
+    # 变换步骤:
+    #   Step 1: Reshape → [W, S, L]  (恢复窗口结构)
+    #   Step 2: Transpose(0, 2, 1) → [W, L, S]  (将 L 移到中间，准备堆叠)
+    #   Step 3: Reshape(-1, S) → [W*L, S]  (沿基因组位置堆叠)
+    #
+    # 最终格式: [W*L, S] = [Total_Variants, Num_Samples]
+    #   - 行: 所有窗口的基因组位点按顺序拼接 (W0_Pos0, W0_Pos1, ..., W0_PosL, W1_Pos0, ...)
+    #   - 列: 样本 (S0, S1, ..., Sn)
 
     num_windows = infer_dataset.window_count
-    samples_per_window = len(infer_dataset) // num_windows
-    L = arr_hap1_wm.shape[1]
+    num_samples = len(infer_dataset) // num_windows  # 每窗口样本数
+    L = arr_hap1_wm.shape[1]  # 窗口序列长度
 
-    print(f"  - Reshaping from Window-Major to Sample-Major...")
+    print(f"  - Reshaping to Genomic-Position-Major format...")
     print(f"    - Num windows: {num_windows}")
-    print(f"    - Samples per window: {samples_per_window}")
+    print(f"    - Num samples: {num_samples}")
+    print(f"    - Total variants: {num_windows * L}")
 
-    # Reshape: [N_total, L] → [Num_Windows, Samples_Per_Window, L]
-    arr_hap1_reshaped = arr_hap1_wm.reshape(num_windows, samples_per_window, L)
-    arr_hap2_reshaped = arr_hap2_wm.reshape(num_windows, samples_per_window, L)
-    arr_gt_reshaped = arr_gt_wm.reshape(num_windows, samples_per_window, L, 4)
-    arr_mask_reshaped = arr_mask_wm.reshape(num_windows, samples_per_window, L)
+    # Step 1: Reshape [N_total, L] → [W, S, L]
+    arr_hap1_reshaped = arr_hap1_wm.reshape(num_windows, num_samples, L)
+    arr_hap2_reshaped = arr_hap2_wm.reshape(num_windows, num_samples, L)
+    arr_gt_reshaped = arr_gt_wm.reshape(num_windows, num_samples, L, 4)
+    arr_mask_reshaped = arr_mask_wm.reshape(num_windows, num_samples, L)
 
-    # Transpose: [Num_Windows, Samples, L] → [Samples, Num_Windows, L]
-    arr_hap1_sm = arr_hap1_reshaped.transpose(1, 0, 2)  # [Samples, Windows, L]
-    arr_hap2_sm = arr_hap2_reshaped.transpose(1, 0, 2)
-    arr_gt_sm = arr_gt_reshaped.transpose(1, 0, 2, 3)    # [Samples, Windows, L, 4]
-    arr_mask_sm = arr_mask_reshaped.transpose(1, 0, 2)
+    print(f"    - After reshape: {arr_hap1_reshaped.shape} (W, S, L)")
 
-    # Flatten: [Samples, Windows, L] → [Samples*Windows, L] (Sample-Major)
-    arr_hap1 = arr_hap1_sm.reshape(-1, L)
-    arr_hap2 = arr_hap2_sm.reshape(-1, L)
-    arr_gt = arr_gt_sm.reshape(-1, L, 4)
-    arr_mask = arr_mask_sm.reshape(-1, L)
+    # Step 2: Transpose(0, 2, 1) → [W, L, S]
+    arr_hap1_reordered = arr_hap1_reshaped.transpose(0, 2, 1)
+    arr_hap2_reordered = arr_hap2_reshaped.transpose(0, 2, 1)
+    arr_gt_reordered = arr_gt_reshaped.transpose(0, 2, 1, 3)  # [W, L, S, 4]
+    arr_mask_reordered = arr_mask_reshaped.transpose(0, 2, 1)
 
-    print(f"  - Reshaped to Sample-Major: {arr_hap1.shape}")
+    print(f"    - After transpose: {arr_hap1_reordered.shape} (W, L, S)")
 
-    # 3. 转换为 VCF 格式
-    # VCFProcessingModule 期望的格式:
-    # - arr_hap1/2: [N_Variants, N_Samples] (转置!)
-    # - arr_gt: [N_Variants, N_Samples, 4]
+    # Step 3: Reshape(-1, S) → [W*L, S]
+    arr_hap1_final = arr_hap1_reordered.reshape(-1, num_samples)
+    arr_hap2_final = arr_hap2_reordered.reshape(-1, num_samples)
+    arr_gt_final = arr_gt_reordered.reshape(-1, num_samples, 4)
+    arr_mask_final = arr_mask_reordered.reshape(-1, num_samples)
 
-    N_samples = arr_hap1.shape[0]
+    print(f"    ✓ Final shape: {arr_hap1_final.shape} [Total_Variants, Num_Samples]")
 
-    # 转置 haplotype probabilities: [N_samples, L] → [L, N_samples]
-    arr_hap1_T = arr_hap1.T
-    arr_hap2_T = arr_hap2.T
-
-    # 转置 genotype probabilities: [N_samples, L, 4] → [L, N_samples, 4]
-    arr_gt_T = arr_gt.transpose(1, 0, 2)
+    # 3. 准备 VCF 数据
+    # arr_hap1_final/arr_hap2_final 已经是正确格式: [N_Variants, N_Samples]
+    # arr_gt_final 已经是正确格式: [N_Variants, N_Samples, 4]
+    N_variants = arr_hap1_final.shape[0]
+    N_samples = arr_hap1_final.shape[1]
 
     # 4. 构建位置数组和 Flag
     # 从 infer_dataset 获取原始位置信息
     ori_pos = infer_dataset.ori_pos  # [N_total_positions]
 
-    # 处理 SOS token 和 Padding (通常数据从 index 1 开始)
-    # 提取实际的变异位点位置
-    actual_len = min(len(ori_pos), L - 1)  # 减去 SOS token
-
-    # 构建位置数组 (从 index 1 开始，跳过 SOS token)
-    final_positions = ori_pos[:actual_len] if actual_len > 0 else ori_pos[:L]
-
-    # Padding 到 L 长度（如果需要）
-    if len(final_positions) < L:
-        final_positions = np.pad(final_positions, (0, L - len(final_positions)), mode='constant')
-    else:
-        final_positions = final_positions[:L]
+    # 重复 ori_pos 以匹配所有窗口
+    # ori_pos 对应单个窗口的位置 [L]，需要沿窗口维度复制
+    # 最终: [W*L] 包含所有窗口的基因组位置
+    final_positions = np.tile(ori_pos, num_windows)[:N_variants]
 
     # 构建 pos_flag (只写入被 mask 的位置)
-    # 使用第一个样本的 mask 作为全局 flag
-    final_pos_flag = arr_mask[0, :L].astype(bool)
+    # 使用所有样本 mask 的逻辑 OR (如果任何样本在该位置被 mask，则写入)
+    final_pos_flag = np.any(arr_mask_final > 0, axis=1).astype(bool)  # [N_Variants]
 
-    print(f"  - Total positions: {len(ori_pos)}")
-    print(f"  - Imputed positions: {final_pos_flag.sum()}")
+    print(f"  - Total genomic positions: {len(ori_pos)} per window × {num_windows} windows = {N_variants}")
+    print(f"  - Imputed positions (mask==1): {final_pos_flag.sum()}")
 
     # 5. 调用 VCFProcessingModule.generate_vcf_efficient_optimized
     output_vcf_path = os.path.join(args.output_path, "imputed.vcf")
-    print(f"  - Writing to: {output_vcf_path}")
+    print(f"  - Writing VCF to: {output_vcf_path}")
 
     try:
         VCFProcessingModule.generate_vcf_efficient_optimized(
             chr_id="21",  # TODO: 从输入 VCF 提取染色体号
             file_path=args.infer_dataset,  # 原始 VCF 文件 (用于获取 Header)
             output_path=output_vcf_path,
-            arr_hap1=arr_hap1_T[:L],      # [N_Variants, N_Samples]
-            arr_hap2=arr_hap2_T[:L],
-            arr_gt=arr_gt_T[:L],          # [N_Variants, N_Samples, 4]
-            arr_pos=final_positions,      # [N_Variants]
-            arr_pos_flag=final_pos_flag,  # [N_Variants]
+            arr_hap1=arr_hap1_final,       # [N_Variants, N_Samples] - 已经是正确格式!
+            arr_hap2=arr_hap2_final,       # [N_Variants, N_Samples]
+            arr_gt=arr_gt_final,           # [N_Variants, N_Samples, 4]
+            arr_pos=final_positions,       # [N_Variants]
+            arr_pos_flag=final_pos_flag,   # [N_Variants]
             chunk_size=100000
         )
         print(f"✓ VCF file generated: {output_vcf_path}")
@@ -434,7 +432,7 @@ def infer():
             f.write("\t".join(sample_names) + "\n")
 
             # 写入数据 (只写入 mask==1 的位置)
-            for pos_idx in range(L):
+            for pos_idx in range(N_variants):
                 if not final_pos_flag[pos_idx]:
                     continue
 
@@ -443,7 +441,7 @@ def infer():
 
                 # 写入每个样本的基因型 (简化版: 只写 GT)
                 for s_idx in range(N_samples):
-                    gt_idx = np.argmax(arr_gt_T[pos_idx, s_idx, :])
+                    gt_idx = np.argmax(arr_gt_final[pos_idx, s_idx, :])
                     gt_map = {0: "0|0", 1: "0|1", 2: "1|0", 3: "1|1"}
                     f.write(f"\t{gt_map[gt_idx]}")
 
