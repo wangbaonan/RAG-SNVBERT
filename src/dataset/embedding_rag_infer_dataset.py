@@ -307,18 +307,20 @@ class EmbeddingRAGInferDataset(InferDataset):
 
         # 使用 Imputation Mask
         current_mask = self.infer_masks[window_idx]
-        output['mask'] = current_mask
-        output['window_idx'] = window_idx  # 确保添加到输出中
+        output['mask'] = torch.from_numpy(current_mask).long() if isinstance(current_mask, np.ndarray) else torch.LongTensor(current_mask)
+        output['window_idx'] = torch.tensor(window_idx, dtype=torch.long)  # 转换为 tensor
 
         # Tokenize (应用 Imputation Mask)
         output['hap_1'] = self.tokenize(output['hap1_nomask'], current_mask)
         output['hap_2'] = self.tokenize(output['hap2_nomask'], current_mask)
 
-        # Float fields
+        # Convert to tensors
         for key in self.long_fields:
-            output[key] = torch.LongTensor(output[key])
+            if not isinstance(output[key], torch.Tensor):
+                output[key] = torch.LongTensor(output[key])
         for key in self.float_fields:
-            output[key] = torch.FloatTensor(output[key])
+            if not isinstance(output[key], torch.Tensor):
+                output[key] = torch.FloatTensor(output[key])
 
         return output
 
