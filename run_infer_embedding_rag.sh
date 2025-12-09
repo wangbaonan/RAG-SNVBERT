@@ -25,7 +25,7 @@ echo "================================================"
 
 # === 模型 Checkpoint ===
 # 使用训练好的最佳模型 checkpoint
-CHECK_POINT="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag/rag_bert.model.ep11"
+CHECK_POINT="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag/rag_bert.model.ep1"
 
 # === 模型架构参数 (必须与训练时一致!) ===
 # 根据 run_v18_embedding_rag.sh 中的训练参数
@@ -41,8 +41,8 @@ REF_PANEL_INFO="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-
 
 # Target Dataset (待填补的数据)
 # 支持 VCF 和 H5 格式
-TARGET_DATASET="/path/to/your/target/data.vcf.gz"  # TODO: 修改为实际路径（VCF 或 H5）
-TARGET_PANEL="/path/to/your/target/panel.txt"      # TODO: 修改为实际路径
+TARGET_DATASET="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/data/train_val_split/test/KGP.chr21.Test2.Mask30.vcf.gz"  # TODO: 修改为实际路径（VCF 或 H5）
+TARGET_PANEL="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/data/train_val_split/test_panel.txt"      # TODO: 修改为实际路径
 
 # Frequency and mapping files (从训练脚本获取正确路径)
 FREQ_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/maf_data/Freq.npy"
@@ -51,7 +51,7 @@ POP_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/m
 POS_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/maf_data/pos_to_idx.bin"
 
 # === 输出路径 ===
-OUTPUT_DIR="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/infer_output_v18"
+OUTPUT_DIR="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/infer_output_v18"
 mkdir -p ${OUTPUT_DIR}
 
 # === 推理参数 ===
