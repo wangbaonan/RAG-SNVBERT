@@ -307,98 +307,129 @@ class EmbeddingRAGInferDataset(InferDataset):
 
         # 使用 Imputation Mask
         current_mask = self.infer_masks[window_idx]
-        output['mask'] = current_mask
-        output['window_idx'] = window_idx  # 确保添加到输出中
+        output['mask'] = torch.from_numpy(current_mask).long() if isinstance(current_mask, np.ndarray) else torch.LongTensor(current_mask)
+        output['window_idx'] = torch.tensor(window_idx, dtype=torch.long)  # 转换为 tensor
 
         # Tokenize (应用 Imputation Mask)
         output['hap_1'] = self.tokenize(output['hap1_nomask'], current_mask)
         output['hap_2'] = self.tokenize(output['hap2_nomask'], current_mask)
 
-        # Float fields
+        # Convert to tensors
         for key in self.long_fields:
-            output[key] = torch.LongTensor(output[key])
+            if not isinstance(output[key], torch.Tensor):
+                output[key] = torch.LongTensor(output[key])
         for key in self.float_fields:
-            output[key] = torch.FloatTensor(output[key])
+            if not isinstance(output[key], torch.Tensor):
+                output[key] = torch.FloatTensor(output[key])
 
         return output
 
     def process_batch_retrieval(self, batch, embedding_layer, device, k_retrieve=1):
         """
-        在主进程中执行 RAG 检索 (Lazy Encoding 优化版)
+        在主进程中执行 RAG 检索 (Lazy Encoding 优化版 - 支持跨窗口 Batch)
 
-        核心流程:
-        1. 编码 Query (Masked 版本, 带梯度)
-        2. FAISS 检索获取 Top-K 索引 (不可微)
-        3. 按需提取: 只从 CPU 内存提取检索到的 Complete Reference Tokens
-        4. 按需编码: 只编码检索到的 Complete Reference (带梯度)
-        5. 返回带梯度的 RAG Embeddings
+        核心改进:
+        1. **Group by Window**: 将 Mixed Batch 按窗口分组
+        2. **Iterative Retrieval**: 对每个窗口分别检索
+        3. **Reconstruct**: 按原顺序重组结果
+        4. **No Grad**: 推理模式，不需要梯度
+
+        Args:
+            batch: CPU batch from DataLoader (dict)
+            embedding_layer: Embedding 层 (用于编码)
+            device: GPU 设备
+            k_retrieve: 检索 K 个最近邻
+
+        Returns:
+            batch: 增强后的 batch，包含 'rag_emb_h1' 和 'rag_emb_h2'
         """
-        window_idx = int(batch['window_idx'][0].item())
-
-        # 1. 编码 Query (Masked 版本)
-        hap_1_tokens = batch['hap_1'].to(device)
+        # 移动数据到 GPU
+        hap_1_tokens = batch['hap_1'].to(device)  # [B, L]
         hap_2_tokens = batch['hap_2'].to(device)
         af = batch['af'].to(device)
+        window_idx_list = batch['window_idx']  # Tensor [B]
 
-        # Query Embeddings (Masked)
-        query_h1_emb = embedding_layer(hap_1_tokens, af=af, pos=True)  # [B, L, D]
-        query_h2_emb = embedding_layer(hap_2_tokens, af=af, pos=True)
+        # 按窗口分组
+        window_groups = defaultdict(list)
+        for i, win_idx in enumerate(window_idx_list):
+            win_idx = int(win_idx.item())
+            window_groups[win_idx].append(i)
 
-        # 2. FAISS 检索
-        B, L, D = query_h1_emb.shape
-        query_h1_flat = query_h1_emb.reshape(B, L * D).detach().cpu().numpy().astype(np.float32)
-        query_h2_flat = query_h2_emb.reshape(B, L * D).detach().cpu().numpy().astype(np.float32)
+        # 初始化 RAG embedding 存储
+        B = hap_1_tokens.size(0)
+        L = hap_1_tokens.size(1)
+        D = self.embed_dim
 
-        # 加载 FAISS 索引
-        index = self.load_index(window_idx)
+        rag_emb_h1_final = torch.zeros(B, k_retrieve, L, D, device=device, dtype=torch.float32)
+        rag_emb_h2_final = torch.zeros(B, k_retrieve, L, D, device=device, dtype=torch.float32)
 
-        # 检索 Top-K
-        _, I1 = index.search(query_h1_flat, k_retrieve)  # [B, K]
-        _, I2 = index.search(query_h2_flat, k_retrieve)
+        # 处理每个窗口 (无梯度模式)
+        with torch.no_grad():
+            for win_idx, indices in window_groups.items():
+                # 获取当前窗口的样本
+                h1_win = hap_1_tokens[indices]  # [B_win, L]
+                h2_win = hap_2_tokens[indices]
+                af_win = af[indices]
 
-        # 3. 按需提取 Complete Reference Tokens
-        ref_tokens_complete = self.ref_tokens_complete[window_idx]  # [num_haps, MAX_SEQ_LEN]
-        ref_af = self.ref_af_windows[window_idx]  # [MAX_SEQ_LEN]
+                # === 步骤1: 编码 Query ===
+                h1_emb = embedding_layer(h1_win, af=af_win, pos=True)  # [B_win, L, D]
+                h2_emb = embedding_layer(h2_win, af=af_win, pos=True)
 
-        # 提取检索到的 Complete Tokens
-        all_indices = np.unique(np.concatenate([I1.flatten(), I2.flatten()]))
-        retrieved_tokens = ref_tokens_complete[all_indices]  # [num_retrieved, MAX_SEQ_LEN]
+                B_win = h1_emb.size(0)
 
-        # 4. 按需编码 Complete Reference (带梯度)
-        num_retrieved = retrieved_tokens.shape[0]
-        ref_af_expanded = np.tile(ref_af, (num_retrieved, 1))
+                # === 步骤2: FAISS 检索 ===
+                # 加载 FAISS 索引
+                index = self.load_index(win_idx)
 
-        retrieved_tokens_tensor = torch.LongTensor(retrieved_tokens).to(device)
-        ref_af_tensor = torch.FloatTensor(ref_af_expanded).to(device)
+                # Flatten 并检索
+                h1_emb_flat = h1_emb.reshape(B_win, L * D).cpu().numpy().astype(np.float32)
+                h2_emb_flat = h2_emb.reshape(B_win, L * D).cpu().numpy().astype(np.float32)
 
-        # 编码 Complete Reference (带梯度!)
-        retrieved_emb = embedding_layer(
-            retrieved_tokens_tensor,
-            af=ref_af_tensor,
-            pos=True
-        )  # [num_retrieved, L, D] 带梯度
+                _, I1 = index.search(h1_emb_flat, k=k_retrieve)  # [B_win, k]
+                _, I2 = index.search(h2_emb_flat, k=k_retrieve)
 
-        # 5. 重映射索引
-        index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(all_indices)}
+                # === 步骤3: 按需提取 Complete Reference Tokens ===
+                unique_indices = np.unique(np.concatenate([I1.flatten(), I2.flatten()]))
 
-        # 6. 构建输出 (保持梯度)
-        rag_emb_h1_final = torch.zeros(B, k_retrieve, L, D, device=device, dtype=retrieved_emb.dtype)
-        rag_emb_h2_final = torch.zeros(B, k_retrieve, L, D, device=device, dtype=retrieved_emb.dtype)
+                ref_tokens_complete = self.ref_tokens_complete[win_idx]  # [num_haps, MAX_SEQ_LEN]
+                ref_af = self.ref_af_windows[win_idx]  # [MAX_SEQ_LEN]
 
-        for i in range(B):
-            # h1 的 top-k
-            for k in range(k_retrieve):
-                old_ref_idx = I1[i, k]
-                new_ref_idx = index_map[old_ref_idx]
-                rag_emb_h1_final[i, k] = retrieved_emb[new_ref_idx]  # [L, D] 带梯度!
+                retrieved_tokens = ref_tokens_complete[unique_indices]  # [num_retrieved, MAX_SEQ_LEN]
+                num_retrieved = retrieved_tokens.shape[0]
 
-            # h2 的 top-k
-            for k in range(k_retrieve):
-                old_ref_idx = I2[i, k]
-                new_ref_idx = index_map[old_ref_idx]
-                rag_emb_h2_final[i, k] = retrieved_emb[new_ref_idx]  # [L, D] 带梯度!
+                # 扩展 AF
+                retrieved_af = np.tile(ref_af, (num_retrieved, 1))  # [num_retrieved, MAX_SEQ_LEN]
 
-        # 7. 赋值到 batch (保持梯度和正确顺序)
+                # === 步骤4: 按需编码 Complete Reference ===
+                retrieved_tokens_tensor = torch.LongTensor(retrieved_tokens).to(device)
+                ref_af_tensor = torch.FloatTensor(retrieved_af).to(device)
+
+                retrieved_emb = embedding_layer(
+                    retrieved_tokens_tensor,
+                    af=ref_af_tensor,
+                    pos=True
+                )  # [num_retrieved, L, D]
+
+                # 创建索引映射
+                index_map = {old_idx: new_idx for new_idx, old_idx in enumerate(unique_indices)}
+
+                # === 步骤5: 收集 Retrieved Embeddings ===
+                for i in range(B_win):
+                    batch_idx = indices[i]  # 全局 batch 中的索引
+
+                    # h1 的 top-k
+                    for k in range(k_retrieve):
+                        old_ref_idx = I1[i, k]
+                        new_ref_idx = index_map[old_ref_idx]
+                        rag_emb_h1_final[batch_idx, k] = retrieved_emb[new_ref_idx]  # [L, D]
+
+                    # h2 的 top-k
+                    for k in range(k_retrieve):
+                        old_ref_idx = I2[i, k]
+                        new_ref_idx = index_map[old_ref_idx]
+                        rag_emb_h2_final[batch_idx, k] = retrieved_emb[new_ref_idx]  # [L, D]
+
+        # 赋值到 batch
         batch['rag_emb_h1'] = rag_emb_h1_final.contiguous()  # [B, k, L, D]
         batch['rag_emb_h2'] = rag_emb_h2_final.contiguous()
 
