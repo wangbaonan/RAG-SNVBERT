@@ -138,6 +138,20 @@ def infer():
     model.eval()
     print(f"✓ Model loaded successfully")
 
+    # 获取 embedding layer (处理 BERTFoundationModel 包装)
+    if hasattr(model, 'bert'):
+        # BERTFoundationModel: model.bert.embedding
+        embedding_layer = model.bert.embedding
+        bert_model = model.bert
+        print(f"  - Model type: BERTFoundationModel (wrapped)")
+    elif hasattr(model, 'embedding'):
+        # 直接的 BERTWithEmbeddingRAG: model.embedding
+        embedding_layer = model.embedding
+        bert_model = model
+        print(f"  - Model type: BERTWithEmbeddingRAG (direct)")
+    else:
+        raise AttributeError(f"Cannot find embedding layer in model type: {type(model).__name__}")
+
     # 3. 创建 Infer Dataset (关键: 传入 embedding_layer)
     print("\n▣ Step 3: Creating EmbeddingRAGInferDataset")
     print(f"  - Target dataset: {args.infer_dataset}")
@@ -153,7 +167,7 @@ def infer():
         poppath=args.pop_path,
         pospath=args.pos_path,
         ref_vcf_path=args.ref_panel,
-        embedding_layer=model.embedding,  # 传入 embedding layer!
+        embedding_layer=embedding_layer,  # 传入 embedding layer!
         build_ref_data=True,
         n_gpu=1,
         name='infer'
@@ -191,13 +205,20 @@ def infer():
             # 执行检索
             batch = infer_dataset.process_batch_retrieval(
                 batch,
-                model.embedding,
+                embedding_layer,
                 device,
                 k_retrieve=args.k_retrieve
             )
 
-            # 模型前向
-            hap_1_output, hap_2_output, _, _ = model(batch)  # [B, L, D]
+            # 模型前向 (处理不同的模型类型)
+            if hasattr(model, 'bert'):
+                # BERTFoundationModel: 返回值多
+                outputs = model(batch)
+                hap_1_output = outputs[0]  # [B, L, 2] (probabilities)
+                hap_2_output = outputs[1]  # [B, L, 2]
+            else:
+                # BERTWithEmbeddingRAG: 直接调用
+                hap_1_output, hap_2_output, _, _ = model(batch)  # [B, L, D]
 
             # 解码
             # 获取 mask 位置
