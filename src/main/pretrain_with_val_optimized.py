@@ -357,7 +357,8 @@ class BERTTrainerWithValidationOptimized():
         if self.use_recon_loss:
             log_dict["avg_recon_loss"] = eval_dict['recon_loss'] / (iter_step + 1)
 
-        data_iter.write(pprint.pformat(log_dict))
+        # 修复: 使用print而非data_iter.write以实现实时打印
+        print(pprint.pformat(log_dict), flush=True)
 
     def _print_epoch_summary(self, epoch, eval_dict, num_batches, batch_size, train=True):
         """打印Epoch总结 (增强版)"""

@@ -934,7 +934,7 @@ class EmbeddingRAGDataset(TrainDataset):
             raise ValueError(f"仅支持 .h5 文件格式")
 
         # 加载其他必需数据
-        from .dataset import PanelData, WindowData
+        from .dataset import PanelData, Window
         panel = PanelData.from_file(str(panelpath_obj))
         freq = np.load(str(freqpath_obj), allow_pickle=True)
 
@@ -950,8 +950,8 @@ class EmbeddingRAGDataset(TrainDataset):
             window_starts.append(start)
             window_ends.append(end)
 
-        window_info = np.column_stack([window_starts, window_ends])
-        window = WindowData(window_info[:, 0], window_info[:, 1])
+        # 使用正确的类名 Window (不是 WindowData)
+        window = Window(np.array(window_starts), np.array(window_ends))
 
         # 加载映射字典
         type_to_idx = torch.load(typepath)
