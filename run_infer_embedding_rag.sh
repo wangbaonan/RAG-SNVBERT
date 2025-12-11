@@ -48,6 +48,7 @@ FREQ_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/
 TYPE_PATH="data/type_to_idx.bin"  # 修正路径（相对路径，从项目根目录）
 POP_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/maf_data/pop_to_idx.bin"
 POS_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/maf_data/pos_to_idx.bin"
+CHROM="chr21"
 
 # === 输出路径 ===
 OUTPUT_DIR="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/infer_output_v18"
@@ -94,6 +95,7 @@ python -m src.infer_embedding_rag \
     --check_point ${CHECK_POINT} \
     --output_path ${OUTPUT_DIR} \
     --dims ${DIMS} \
+    --chrom ${CHROM} \
     --layers ${LAYERS} \
     --attn_heads ${HEADS} \
     --infer_batch_size ${BATCH_SIZE} \
