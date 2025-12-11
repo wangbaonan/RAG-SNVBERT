@@ -55,10 +55,11 @@ class EmbeddingRAGDataset(TrainDataset):
 
         # Embedding RAG特有的数据结构
         self.ref_tokens_complete = []     # 完整tokens (无mask) [window_idx][num_haps, L]
-        self.raw_window_masks = []        # 原始mask
-        self.window_masks = []            # 填充后的mask
+        # [FIX] 预分配空间，防止赋值时越界
+        self.raw_window_masks = [None] * self.window_count  # 原始mask
+        self.window_masks = [None] * self.window_count      # 填充后的mask
         self.mask_version = 0             # 当前mask版本号
-        self.ref_af_windows = []          # AF信息 [window_idx][L]
+        self.ref_af_windows = []          # AF信息 [window_idx][L] (将在 _precompute_window_lens 中填充)
         self.window_valid_indices = {}    # [FIX] 记录每个窗口的有效位点索引 (用于过滤训练数据)
         self.window_actual_lens = []      # 每个窗口过滤后的实际长度 [window_idx]
 
@@ -122,43 +123,57 @@ class EmbeddingRAGDataset(TrainDataset):
 
     def _precompute_window_lens(self):
         """
-        [V18 FIX] 预计算所有窗口的实际长度
+        [V18 FIX] 预计算所有窗口的实际长度和AF数据
         这是 regenerate_masks 所必需的，必须在初始化时完成。
-        只做位点交叉计算，利用 np.isin 加速，不会阻塞启动。
+        AF数据很小(几MB)，预加载到内存可加速后续JIT构建和Mask生成。
         """
-        print(f"▣ 预计算窗口长度 (用于 Mask 生成)...")
+        print(f"▣ 预计算窗口元数据 (长度 & AF)...")
         self.window_actual_lens = []
         self.window_valid_indices = {}
+        self.ref_af_windows = []  # 重置 AF 列表
 
         # 确保 ref_pos 已加载
         if self.ref_pos is None and self.ref_vcf_path:
             _, self.ref_pos = self._load_ref_data(self.ref_vcf_path)
 
-        for w_idx in tqdm(range(self.window_count), desc="计算窗口长度"):
+        # AF计算所需的常量
+        AF_IDX = 3
+        GLOBAL_IDX = 5
+
+        for w_idx in tqdm(range(self.window_count), desc="计算窗口元数据"):
             # 1. 获取窗口的SNP范围
             start = self.window.window_info[w_idx, 0]
             end = self.window.window_info[w_idx, 1]
             train_pos = self.pos[start:end]
 
             # 2. 计算有效位点 (与 Reference 的交集)
-            if self.ref_pos is not None:
-                # 快速判断 train_pos 中的点是否在 ref_pos 中
-                is_valid = np.isin(train_pos, self.ref_pos)
-                valid_mask = np.where(is_valid)[0]
+            filtered_pos = train_pos  # 默认全部有效
+            window_len = len(train_pos)
 
-                # 如果有位点被过滤
-                if len(valid_mask) < len(train_pos):
+            if self.ref_pos is not None:
+                is_valid = np.isin(train_pos, self.ref_pos)
+                # 如果有位点需要过滤
+                if not np.all(is_valid):
+                    valid_mask = np.where(is_valid)[0]
                     self.window_valid_indices[w_idx] = valid_mask
-                    window_len = len(valid_mask)
-                else:
-                    window_len = len(train_pos)
-            else:
-                # 如果没有 ref_pos，则假设全部有效
-                window_len = len(train_pos)
+                    filtered_pos = train_pos[valid_mask]  # 更新为过滤后的位点
+                    window_len = len(filtered_pos)
 
             self.window_actual_lens.append(window_len)
 
-        print(f"✓ 窗口长度预计算完成 (总窗口数: {len(self.window_actual_lens)})")
+            # 3. [FIX] 预计算 AF (用于 regenerate_masks)
+            # 即使是 JIT 模式，AF 数据也必须常驻内存以支持 Smart Masking
+            ref_af = np.array([
+                self.freq[AF_IDX][GLOBAL_IDX][self.pos_to_idx[p]]
+                if p in self.pos_to_idx else 0.0
+                for p in filtered_pos  # 使用过滤后的位点
+            ], dtype=np.float32)
+
+            # Padding到MAX_SEQ_LEN
+            ref_af = VCFProcessingModule.sequence_padding(ref_af, dtype='float')  # [MAX_SEQ_LEN]
+            self.ref_af_windows.append(ref_af)
+
+        print(f"✓ 窗口元数据计算完成 (总窗口数: {len(self.window_actual_lens)}, AF数据已加载)")
 
     def _build_embedding_indexes(self, ref_vcf_path: str, embedding_layer):
         """
@@ -395,17 +410,9 @@ class EmbeddingRAGDataset(TrainDataset):
             train_pos = train_pos[valid_pos_mask]
             window_len = len(train_pos)
 
-        # 3. 快速提取AF (CRITICAL: 必须从self.freq查找，严禁重新计算!)
-        AF_IDX = 3
-        GLOBAL_IDX = 5
-        ref_af = np.array([
-            self.freq[AF_IDX][GLOBAL_IDX][self.pos_to_idx[p]]
-            if p in self.pos_to_idx else 0.0
-            for p in train_pos
-        ], dtype=np.float32)
-
-        # Padding到MAX_SEQ_LEN
-        ref_af = VCFProcessingModule.sequence_padding(ref_af, dtype='float')
+        # 3. [OPTIMIZATION] 直接使用预计算的AF数据 (从 _precompute_window_lens 缓存中读取)
+        # 这避免了重复计算，加速JIT构建
+        ref_af = self.ref_af_windows[w_idx]  # 已经过padding的AF数据 [MAX_SEQ_LEN]
         self.jit_ref_af = ref_af  # 缓存AF数据
 
         # 4. 生成AF-Guided Mask
