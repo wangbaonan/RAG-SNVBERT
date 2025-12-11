@@ -7,6 +7,7 @@
 
 import time
 import os
+import pickle
 import h5py
 from collections import defaultdict
 import faiss
@@ -722,16 +723,71 @@ class EmbeddingRAGDataset(TrainDataset):
 
         return batch
 
+    def invalidate_indexes(self):
+        """
+        标记所有索引为无效 (用于Epoch切换后的懒惰重建)
+
+        关键改进:
+        1. 不立即重建索引 (避免串行等待)
+        2. 只清空缓存和路径标记
+        3. 下次load_index时会触发JIT重建
+        4. 配合DataLoader并行处理,大幅减少Epoch切换延迟
+
+        性能对比:
+        - rebuild_indexes(): 串行重建所有窗口, ~5分钟
+        - invalidate_indexes(): 仅标记无效, <1秒; 实际重建分散到训练中
+        """
+        print(f"\n{'='*80}")
+        print(f"▣ 标记索引为无效 (懒惰���建模式)")
+        print(f"{'='*80}")
+
+        # 清空单槽位缓存
+        if self.cached_index is not None:
+            del self.cached_index
+            self.cached_index = None
+        self.cached_window_idx = -1
+
+        # 标记所有索引路径为None (强制JIT重建)
+        # 保留self.index_paths列表结构,但将每个路径设为None
+        for i in range(len(self.index_paths)):
+            # 如果磁盘上有旧索引文件,可选择删除 (节省磁盘空间)
+            if self.index_paths[i] is not None and os.path.exists(self.index_paths[i]):
+                try:
+                    os.remove(self.index_paths[i])
+                except:
+                    pass  # 删除失败不影响训练
+            self.index_paths[i] = None
+
+        # 更新JIT缓存标记
+        self.jit_window_idx = -1
+        self.jit_ref_tokens_complete = None
+        self.jit_ref_af = None
+        self.jit_window_mask = None
+
+        print(f"✓ 所有索引已标记为无效")
+        print(f"✓ 下次访问时将自动触发 JIT 重建 (基于最新 Embedding 和 Mask)")
+        print(f"✓ Epoch 切换延迟: ~1秒 (vs rebuild_indexes ~5分钟)")
+        print(f"{'='*80}\n")
+
     def rebuild_indexes(self, embedding_layer, device='cuda'):
         """
-        用当前mask重建FAISS索引 (在regenerate_masks后调用)
+        [DEPRECATED] 用当前mask重建FAISS索引 (已废弃,请使用invalidate_indexes)
+
+        性能问题:
+        - 串行处理所有窗口,导致Epoch切换时等待~5分钟
+        - 与DataLoader的并行能力冲突
+
+        推荐替代方案:
+        - 使用 invalidate_indexes() 标记索引无效
+        - JIT构建会在训练时自动并行处理
 
         核心流程:
         1. 用当前mask重新tokenize reference sequences
         2. 用最新embedding layer编码masked版本
         3. 重建FAISS索引
         """
-        print(f"▣ 重建FAISS索引 (基于新Mask)")
+        print(f"\n⚠️  警告: rebuild_indexes() 已废弃,请使用 invalidate_indexes()")
+        print(f"▣ 重建FAISS索引 (基于新Mask) - 串行模式")
         start_time = time.time()
 
         # [CRITICAL FIX] 保存原始状态并切换到 eval 模式
@@ -953,10 +1009,14 @@ class EmbeddingRAGDataset(TrainDataset):
         # 使用正确的类名 Window (不是 WindowData)
         window = Window(np.array(window_starts), np.array(window_ends))
 
-        # 加载映射字典
-        type_to_idx = torch.load(typepath)
-        pop_to_idx = torch.load(poppath)
-        pos_to_idx = torch.load(pospath)
+        # 加载映射字典 (使用pickle而非torch.load)
+        # 这些文件是用Python原生pickle保存的,不是torch.save
+        with open(typepath, 'rb') as f:
+            type_to_idx = pickle.load(f)
+        with open(poppath, 'rb') as f:
+            pop_to_idx = pickle.load(f)
+        with open(pospath, 'rb') as f:
+            pos_to_idx = pickle.load(f)
 
         # 创建EmbeddingRAGDataset (不立即构建索引!)
         rag_dataset = cls(

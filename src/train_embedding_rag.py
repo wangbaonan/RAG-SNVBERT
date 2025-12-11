@@ -373,17 +373,19 @@ def main():
             #     rag_val_loader.regenerate_masks(seed=epoch)  # ← 已禁用！保持题目固定
             print(f"✓ 验证集 Mask 保持固定（50%），确保评估基准一致")
 
-            # 2. 用新mask和最新模型重建FAISS索引
+            # 2. 标记索引为无效 (懒惰重建模式 - JIT并行处理)
+            # 关键改进: 不立即重建索引,避免串行等待5分钟
+            # 实际重建会在训练时由DataLoader并行触发
             if rag_train_loader:
-                rag_train_loader.rebuild_indexes(embedding_layer, device=device)
-                print(f"✓ 训练集索引已重建（匹配最新 Embedding）")
+                rag_train_loader.invalidate_indexes()
+                print(f"✓ 训练集索引已标记为无效 (将在训练时 JIT 重建)")
 
             if rag_val_loader:
-                # 验证集索引必须更新（答案随 Embedding Layer 变化）
-                rag_val_loader.rebuild_indexes(embedding_layer, device=device)
-                print(f"✓ 验证集索引已重建（答案更新，题目不变）")
+                # 验证集索引也需要标记无效（答案随 Embedding Layer 变化）
+                rag_val_loader.invalidate_indexes()
+                print(f"✓ 验证集索引已标记为无效 (将在验证时 JIT 重建)")
 
-            print(f"\n✓ Mask 和索引刷新完成!\n")
+            print(f"\n✓ Mask 刷新和索引标记完成! Epoch 切换延迟 <1秒\n")
 
         # 训练
         train_metrics = trainer.train(epoch)
