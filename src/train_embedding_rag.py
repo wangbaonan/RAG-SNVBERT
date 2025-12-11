@@ -282,7 +282,8 @@ def main():
         # [FIX] 立即刷新 Mask 和索引，确保 Epoch 1 即为 50% 难度，与后续 Epoch 保持一致
         print(f"Applying 50% mask immediately for consistency...")
         rag_val_loader.regenerate_masks(seed=2024)  # 使用固定种子确保可复现
-        rag_val_loader.rebuild_indexes(embedding_layer, device=device)
+        # [OPTIMIZATION] 移除 rebuild_indexes，改用 invalidate_indexes 触发 JIT
+        rag_val_loader.invalidate_indexes()  # 验证时会自动构建
 
         print(f"✓ Validation mask level set to 50%")
         print(f"✓ Validation difficulty is now FIXED for all epochs")

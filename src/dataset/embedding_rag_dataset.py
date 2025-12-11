@@ -112,6 +112,54 @@ class EmbeddingRAGDataset(TrainDataset):
             print(f"✓ JIT索引构建: 训练时按需构建，启动延迟<1s")
             print(f"{'='*80}\n")
 
+            # [FIX 1] 必须预计算窗口长度，否则 regenerate_masks 会报错
+            # 即使是 JIT 模式，Mask 生成也依赖于窗口长度信息
+            self._precompute_window_lens()
+
+            # [FIX 2] 初始化 Epoch 0 的 Mask
+            # 必须在 _precompute_window_lens 之后调用，解决启动时 list index out of range
+            self.regenerate_masks(seed=0)
+
+    def _precompute_window_lens(self):
+        """
+        [V18 FIX] 预计算所有窗口的实际长度
+        这是 regenerate_masks 所必需的，必须在初始化时完成。
+        只做位点交叉计算，利用 np.isin 加速，不会阻塞启动。
+        """
+        print(f"▣ 预计算窗口长度 (用于 Mask 生成)...")
+        self.window_actual_lens = []
+        self.window_valid_indices = {}
+
+        # 确保 ref_pos 已加载
+        if self.ref_pos is None and self.ref_vcf_path:
+            _, self.ref_pos = self._load_ref_data(self.ref_vcf_path)
+
+        for w_idx in tqdm(range(self.window_count), desc="计算窗口长度"):
+            # 1. 获取窗口的SNP范围
+            start = self.window.window_info[w_idx, 0]
+            end = self.window.window_info[w_idx, 1]
+            train_pos = self.pos[start:end]
+
+            # 2. 计算有效位点 (与 Reference 的交集)
+            if self.ref_pos is not None:
+                # 快速判断 train_pos 中的点是否在 ref_pos 中
+                is_valid = np.isin(train_pos, self.ref_pos)
+                valid_mask = np.where(is_valid)[0]
+
+                # 如果有位点被过滤
+                if len(valid_mask) < len(train_pos):
+                    self.window_valid_indices[w_idx] = valid_mask
+                    window_len = len(valid_mask)
+                else:
+                    window_len = len(train_pos)
+            else:
+                # 如果没有 ref_pos，则假设全部有效
+                window_len = len(train_pos)
+
+            self.window_actual_lens.append(window_len)
+
+        print(f"✓ 窗口长度预计算完成 (总窗口数: {len(self.window_actual_lens)})")
+
     def _build_embedding_indexes(self, ref_vcf_path: str, embedding_layer):
         """
         构建Embedding-based FAISS索引 (内存优化版)
