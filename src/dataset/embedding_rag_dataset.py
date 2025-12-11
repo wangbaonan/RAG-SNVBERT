@@ -20,8 +20,9 @@ from .dataset import TrainDataset
 from .utils import timer, PanelProcessingModule, VCFProcessingModule
 
 # DEFAULT MAXIMUM SEQUENCE LENGTH
-INFER_WINDOW_LEN = 1020
-MAX_SEQ_LEN = 1030
+# 修改为512以支持固定窗口大小 (511 SNPs + 1 SOS = 512)
+INFER_WINDOW_LEN = 511
+MAX_SEQ_LEN = 512
 
 
 class EmbeddingRAGDataset(TrainDataset):
@@ -84,8 +85,31 @@ class EmbeddingRAGDataset(TrainDataset):
         self.embedding_layer = embedding_layer
         self.embed_dim = embedding_layer.embed_size if embedding_layer else None
 
-        if build_ref_data and ref_vcf_path and embedding_layer:
-            self._build_embedding_indexes(ref_vcf_path, embedding_layer)
+        # === JIT构建策略: 不预先构建所有索引 ===
+        # 存储参考面板数据到内存，索引按需构建
+        self.ref_vcf_path = ref_vcf_path
+        self.ref_gt = None  # 延迟加载
+        self.ref_pos = None  # 延迟加载
+
+        # JIT缓存: 当前窗口的数据
+        self.jit_window_idx = -1  # 当前JIT构建的窗口ID
+        self.jit_ref_tokens_complete = None  # 当前窗口的complete tokens
+        self.jit_ref_af = None  # 当前窗口的AF数据
+        self.jit_window_mask = None  # 当前窗口的mask
+
+        # 如果需要，只加载参考面板的原始GT和POS数据到内存
+        if build_ref_data and ref_vcf_path:
+            print(f"\n{'='*80}")
+            print(f"▣ 加载参考面板原始数据 (JIT模式 - 不预构建索引)")
+            print(f"{'='*80}")
+            start_time = time.time()
+            self.ref_gt, self.ref_pos = self._load_ref_data(ref_vcf_path)
+            print(f"✓ 参考面板加载完成:")
+            print(f"  - 样本数: {self.ref_gt.shape[1]}")
+            print(f"  - 位点数: {self.ref_gt.shape[0]}")
+            print(f"  - 耗时: {time.time() - start_time:.2f}s")
+            print(f"✓ JIT索引构建: 训练时按需构建，启动延迟<1s")
+            print(f"{'='*80}\n")
 
     def _build_embedding_indexes(self, ref_vcf_path: str, embedding_layer):
         """
@@ -278,6 +302,138 @@ class EmbeddingRAGDataset(TrainDataset):
         print(f"  - 总耗时: {time.time() - start_time:.2f}s")
         print("=" * 80)
 
+    def _jit_build_window_data(self, w_idx):
+        """
+        JIT (Just-In-Time) 构建窗口数据和FAISS索引
+
+        关键改进:
+        1. 按需构建: 只在首次访问窗口时构建索引
+        2. 快速AF提取: 从self.freq直接lookup，严禁重新计算
+        3. AF-Guided Mask: 使用self.mask_version支持课程学习
+        4. Tokenize & Encode: 使用self.embedding_layer的实时权重
+        5. 构建FAISS索引并保存到磁盘
+
+        Args:
+            w_idx: 窗口索引
+
+        Returns:
+            None (将数据缓存到 self.jit_* 变量中)
+        """
+        # 1. 获取窗口的SNP范围
+        current_slice = slice(
+            self.window.window_info[w_idx, 0],
+            self.window.window_info[w_idx, 1]
+        )
+        window_len = current_slice.stop - current_slice.start
+
+        # 2. 提取训练位点并匹配参考面板
+        train_pos = self.pos[current_slice]
+        ref_indices = []
+        valid_pos_mask = []
+
+        for idx, p in enumerate(train_pos):
+            matches = np.where(self.ref_pos == p)[0]
+            if len(matches) > 0:
+                ref_indices.append(matches[0])
+                valid_pos_mask.append(idx)
+
+        # 如果有位点被过滤，更新窗口长度
+        if len(ref_indices) < len(train_pos):
+            if len(valid_pos_mask) == 0:
+                raise ValueError(f"窗口 {w_idx} 没有可用位点")
+            valid_indices = current_slice.start + np.array(valid_pos_mask)
+            current_slice = valid_indices
+            train_pos = train_pos[valid_pos_mask]
+            window_len = len(train_pos)
+
+        # 3. 快速提取AF (CRITICAL: 必须从self.freq查找，严禁重新计算!)
+        AF_IDX = 3
+        GLOBAL_IDX = 5
+        ref_af = np.array([
+            self.freq[AF_IDX][GLOBAL_IDX][self.pos_to_idx[p]]
+            if p in self.pos_to_idx else 0.0
+            for p in train_pos
+        ], dtype=np.float32)
+
+        # Padding到MAX_SEQ_LEN
+        ref_af = VCFProcessingModule.sequence_padding(ref_af, dtype='float')
+        self.jit_ref_af = ref_af  # 缓存AF数据
+
+        # 4. 生成AF-Guided Mask
+        rare_af_threshold = 0.05
+        rare_mask_rate = 0.7
+        current_mask_rate = self._TrainDataset__mask_rate[self._TrainDataset__level]
+
+        af_data_unpadded = ref_af[:window_len]
+        probs = np.where(af_data_unpadded < rare_af_threshold, rare_mask_rate, current_mask_rate)
+
+        # 生成mask (使用mask_version作为种子以支持课程学习)
+        np.random.seed(self.mask_version * 10000 + w_idx)
+        raw_mask = super().generate_mask(window_len, probs=probs)
+        padded_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
+        self.jit_window_mask = padded_mask  # 缓存mask
+
+        # 创建完整mask (全0)
+        raw_mask_complete = np.zeros_like(raw_mask)
+        padded_mask_complete = VCFProcessingModule.sequence_padding(raw_mask_complete, dtype='int')
+
+        # 5. 获取参考序列
+        raw_ref = self.ref_gt[current_slice, :, :]  # [L, num_samples, 2]
+        raw_ref = raw_ref.reshape(raw_ref.shape[0], -1)  # [L, num_haps]
+        raw_ref = raw_ref.T  # [num_haps, L]
+
+        # 6. Tokenize两个版本
+        ref_tokens_masked = self.tokenize(raw_ref, padded_mask)  # [num_haps, MAX_SEQ_LEN]
+        ref_tokens_complete = self.tokenize(raw_ref, padded_mask_complete)
+        self.jit_ref_tokens_complete = ref_tokens_complete  # 缓存complete tokens
+
+        # 7. 扩展AF到所有haplotypes
+        num_haps_in_window = ref_tokens_masked.shape[0]
+        ref_af_expanded = np.tile(ref_af, (num_haps_in_window, 1))
+
+        # 8. 编码masked版本并构建FAISS索引
+        device = next(self.embedding_layer.parameters()).device
+
+        # [CRITICAL] 保存训练状态并切换到eval模式
+        was_training = self.embedding_layer.training
+        self.embedding_layer.eval()
+
+        try:
+            with torch.no_grad():
+                ref_tokens_masked_tensor = torch.LongTensor(ref_tokens_masked).to(device)
+                ref_af_tensor = torch.FloatTensor(ref_af_expanded).to(device)
+                ref_emb_masked = self.embedding_layer(ref_tokens_masked_tensor, af=ref_af_tensor, pos=True)
+
+                # 构建FAISS索引
+                num_haps, L, D = ref_emb_masked.shape
+                ref_emb_masked_flat = ref_emb_masked.reshape(num_haps, L * D)
+                ref_emb_masked_flat_np = ref_emb_masked_flat.cpu().numpy().astype(np.float32)
+
+                # 创建并保存索引
+                index = faiss.IndexFlatL2(L * D)
+                index.add(ref_emb_masked_flat_np)
+
+                # 保存到磁盘
+                index_path = os.path.join(self.index_dir, f"index_{w_idx}.faiss")
+                faiss.write_index(index, index_path)
+
+                # 确保index_paths有足够长度
+                while len(self.index_paths) <= w_idx:
+                    self.index_paths.append(None)
+                self.index_paths[w_idx] = index_path
+
+                # 清理GPU内存
+                del ref_tokens_masked_tensor, ref_af_tensor, ref_emb_masked, ref_emb_masked_flat, ref_emb_masked_flat_np, index
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+
+        finally:
+            # 恢复原始训练状态
+            self.embedding_layer.train(was_training)
+
+        # 更新JIT缓存标记
+        self.jit_window_idx = w_idx
+
     def regenerate_masks(self, seed: int):
         """
         [AF-GUIDED MASKING] 重新生成所有窗口的mask (基于 AF，而非样本内容)
@@ -359,24 +515,28 @@ class EmbeddingRAGDataset(TrainDataset):
         if w_idx == self.cached_window_idx and self.cached_index is not None:
             return self.cached_index
 
-        # === 缓存未命中: 从磁盘加载并转为 GPU 索引 ===
-        # 释放旧 GPU 缓存 (节省显存)
+        # === 检查索引是否存在，不存在则JIT构建 ===
+        if w_idx >= len(self.index_paths) or self.index_paths[w_idx] is None or not os.path.exists(self.index_paths[w_idx] if w_idx < len(self.index_paths) and self.index_paths[w_idx] else ""):
+            print(f"  JIT: 构建窗口 {w_idx} 的索引...")
+            self._jit_build_window_data(w_idx)
+
+        # === 缓存未命中: 从磁盘加载并转为GPU索引 ===
+        # 释放旧GPU缓存 (节省显存)
         if self.cached_index is not None:
             del self.cached_index
             self.cached_index = None
 
-        # 从磁盘读取 CPU 索引
+        # 从磁盘读取CPU索引
         cpu_index = faiss.read_index(self.index_paths[w_idx])
 
-        # 转换为 GPU 索引 (设备 ID 0)
-        # faiss.index_cpu_to_gpu 会自动处理数据传输和内存管理
+        # 转换为GPU索引 (设备 ID 0)
         gpu_index = faiss.index_cpu_to_gpu(self.gpu_res, 0, cpu_index)
 
-        # 缓存 GPU 索引
+        # 缓存GPU索引
         self.cached_index = gpu_index
         self.cached_window_idx = w_idx
 
-        # 释放 CPU 索引 (不再需要)
+        # 释放CPU索引
         del cpu_index
 
         return self.cached_index
@@ -504,9 +664,16 @@ class EmbeddingRAGDataset(TrainDataset):
             unique_indices_h2 = np.unique(I2.flatten())
             unique_indices = np.unique(np.concatenate([unique_indices_h1, unique_indices_h2]))
 
-            # 从CPU内存提取对应的 tokens 和 AF
-            ref_tokens_complete = self.ref_tokens_complete[win_idx]  # [num_haps, L]
-            ref_af = self.ref_af_windows[win_idx]  # [L]
+            # 从JIT缓存或预构建数据中提取 tokens 和 AF
+            # 如果是JIT构建，优先使用JIT缓存; 否则使用预构建的数据
+            if self.jit_window_idx == win_idx and self.jit_ref_tokens_complete is not None:
+                # JIT模式: 使用JIT缓存
+                ref_tokens_complete = self.jit_ref_tokens_complete  # [num_haps, L]
+                ref_af = self.jit_ref_af  # [L]
+            else:
+                # 预构建模式: 使用预存储的数据 (兼容性)
+                ref_tokens_complete = self.ref_tokens_complete[win_idx]  # [num_haps, L]
+                ref_af = self.ref_af_windows[win_idx]  # [L]
 
             # 只提取需要的 haplotypes
             retrieved_tokens = ref_tokens_complete[unique_indices]  # [num_retrieved, L]
@@ -726,7 +893,7 @@ class EmbeddingRAGDataset(TrainDataset):
                   vcfpath,
                   panelpath,
                   freqpath,
-                  windowpath,
+                  window_size,  # 修改: 改为固定窗口大小
                   typepath,
                   poppath,
                   pospath,
@@ -737,34 +904,74 @@ class EmbeddingRAGDataset(TrainDataset):
                   use_dynamic_mask=False,
                   name='default'):
         """
-        从文件创建EmbeddingRAGDataset
+        从文件创建EmbeddingRAGDataset (JIT版本 - 固定窗口大小)
 
-        重要: 必须提供embedding_layer用于预编码!
+        重要变更:
+        1. 不再依赖外部window文件，使用固定窗口大小切分
+        2. 索引按需构建 (JIT)，训练几乎立即开始
+        3. 配合WindowGroupedSampler，内存中只保留当前窗口索引
 
         Args:
+            window_size: 固定窗口大小 (默认511，加SOS后512)
             name: 数据集名称 (用于区分训练集/验证集的索引目录)
                   训练集应使用 'train', 验证集应使用 'val'
         """
-        # 调用父类创建基础dataset
-        base_dataset = TrainDataset.from_file(
-            vocab, vcfpath, panelpath, freqpath, windowpath,
-            typepath, poppath, pospath
-        )
+        # 首先加载基础数据但不创建窗口
+        import pathlib
+        import h5py
 
-        # 创建EmbeddingRAGDataset
+        filepath = pathlib.Path(vcfpath)
+        panelpath_obj = pathlib.Path(panelpath)
+        freqpath_obj = pathlib.Path(freqpath)
+
+        # 加载 VCF/H5 数据
+        if filepath.name.endswith('.h5'):
+            h5_file = h5py.File(filepath, 'r')
+            vcf_data = h5_file['calldata/GT'][:]
+            pos_data = h5_file['variants/POS'][:]
+            h5_file.close()
+        else:
+            raise ValueError(f"仅支持 .h5 文件格式")
+
+        # 加载其他必需数据
+        from .dataset import PanelData, WindowData
+        panel = PanelData.from_file(str(panelpath_obj))
+        freq = np.load(str(freqpath_obj), allow_pickle=True)
+
+        # 动态计算窗口信息 (基于固定window_size)
+        total_snps = len(pos_data)
+        num_windows = (total_snps + window_size - 1) // window_size  # 向上取整
+
+        window_starts = []
+        window_ends = []
+        for i in range(num_windows):
+            start = i * window_size
+            end = min((i + 1) * window_size, total_snps)
+            window_starts.append(start)
+            window_ends.append(end)
+
+        window_info = np.column_stack([window_starts, window_ends])
+        window = WindowData(window_info[:, 0], window_info[:, 1])
+
+        # 加载映射字典
+        type_to_idx = torch.load(typepath)
+        pop_to_idx = torch.load(poppath)
+        pos_to_idx = torch.load(pospath)
+
+        # 创建EmbeddingRAGDataset (不立即构建索引!)
         rag_dataset = cls(
-            vocab=base_dataset.vocab,
-            vcf=base_dataset.vcf,
-            pos=base_dataset.pos,
-            panel=base_dataset.panel,
-            freq=base_dataset.freq,
-            window=base_dataset.window,
-            type_to_idx=base_dataset.type_to_idx,
-            pop_to_idx=base_dataset.pop_to_idx,
-            pos_to_idx=base_dataset.pos_to_idx,
+            vocab=vocab,
+            vcf=vcf_data,
+            pos=pos_data,
+            panel=panel,
+            freq=freq,
+            window=window,
+            type_to_idx=type_to_idx,
+            pop_to_idx=pop_to_idx,
+            pos_to_idx=pos_to_idx,
             ref_vcf_path=ref_vcf_path,
             embedding_layer=embedding_layer,
-            build_ref_data=build_ref_data,
+            build_ref_data=build_ref_data,  # 这将被改为JIT构建
             n_gpu=n_gpu,
             use_dynamic_mask=use_dynamic_mask,
             name=name  # 传递name参数

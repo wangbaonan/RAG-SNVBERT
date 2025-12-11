@@ -32,7 +32,7 @@ def main():
     # RAG参数
     parser.add_argument("--refpanel_path", required=True, type=str, help="参考面板VCF")
     parser.add_argument("--freq_path", required=True, type=str, help="频率文件")
-    parser.add_argument("--window_path", required=True, type=str, help="窗口文件")
+    parser.add_argument("--window_size", type=int, default=511, help="固定窗口大小 (默认511,加SOS后512)")
     parser.add_argument("--type_path", required=True, type=str, help="type映射文件")
     parser.add_argument("--pop_path", required=True, type=str, help="pop映射文件")
     parser.add_argument("--pos_path", required=True, type=str, help="pos映射文件")
@@ -201,7 +201,7 @@ def main():
         args.train_dataset,
         args.train_panel,
         args.freq_path,
-        args.window_path,
+        args.window_size,  # 使用固定窗口大小替代window_path
         args.type_path,
         args.pop_path,
         args.pos_path,
@@ -243,7 +243,7 @@ def main():
             args.val_dataset,
             args.val_panel,
             args.freq_path,
-            args.window_path,
+            args.window_size,  # 使用固定窗口大小替代window_path
             args.type_path,
             args.pop_path,
             args.pos_path,
