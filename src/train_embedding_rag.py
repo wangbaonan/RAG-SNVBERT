@@ -279,10 +279,12 @@ def main():
         for _ in range(4):  # 从level=0提升到level=4 (50% mask)
             rag_val_loader.add_level()
 
-        # [FIX] 立即刷新 Mask 和索引，确保 Epoch 1 即为 50% 难度，与后续 Epoch 保持一致
+        # [FIX] 立即刷新 Mask，确保 Epoch 1 即为 50% 难度，与后续 Epoch 保持一致
         print(f"Applying 50% mask immediately for consistency...")
         rag_val_loader.regenerate_masks(seed=2024)  # 使用固定种子确保可复现
-        rag_val_loader.rebuild_indexes(embedding_layer, device=device)
+        # [V18 GPU-JIT] 不再需要 rebuild_indexes，索引将在训练时 JIT 构建
+        # 强制重置缓存，防止使用旧 Mask 的索引
+        rag_val_loader.jit_cache_win_idx = -1
 
         print(f"✓ Validation mask level set to 50%")
         print(f"✓ Validation difficulty is now FIXED for all epochs")
@@ -373,17 +375,18 @@ def main():
             #     rag_val_loader.regenerate_masks(seed=epoch)  # ← 已禁用！保持题目固定
             print(f"✓ 验证集 Mask 保持固定（50%），确保评估基准一致")
 
-            # 2. 用新mask和最新模型重建FAISS索引
+            # 2. [V18 GPU-JIT] 强制重置JIT缓存，防止 Epoch 间使用旧 Mask 的索引
+            # 索引将在训练时自动 JIT 构建（基于最新 Mask 和 Embedding）
             if rag_train_loader:
-                rag_train_loader.rebuild_indexes(embedding_layer, device=device)
-                print(f"✓ 训练集索引已重建（匹配最新 Embedding）")
+                rag_train_loader.jit_cache_win_idx = -1
+                print(f"✓ 训练集缓存已重置（将在训练时 JIT 重建）")
 
             if rag_val_loader:
-                # 验证集索引必须更新（答案随 Embedding Layer 变化）
-                rag_val_loader.rebuild_indexes(embedding_layer, device=device)
-                print(f"✓ 验证集索引已重建（答案更新，题目不变）")
+                # 验证集索引也需要重置（答案随 Embedding Layer 变化）
+                rag_val_loader.jit_cache_win_idx = -1
+                print(f"✓ 验证集缓存已重置（将在验证时 JIT 重建）")
 
-            print(f"\n✓ Mask 和索引刷新完成!\n")
+            print(f"\n✓ Mask 刷新和缓存重置完成! (GPU-JIT 模式)\n")
 
         # 训练
         train_metrics = trainer.train(epoch)
@@ -391,6 +394,12 @@ def main():
         # 验证
         if val_dataloader:
             val_metrics = trainer.validate(epoch)
+
+            # [V18 GPU-JIT] 验证结束后清空验证集的 GPU 缓存
+            # 避免占用训练显存
+            if rag_val_loader:
+                rag_val_loader.clear_jit_cache()
+                print(f"✓ 验证集 GPU 缓存已清空")
 
             # 保存模型
             is_best = (trainer.epochs_no_improve == 0)
@@ -402,12 +411,6 @@ def main():
                 break
         else:
             trainer.save(epoch, args.output_path)
-
-        # === 修改: refresh_complete_embeddings已删除 ===
-        # 现在使用按需编码，不预存储complete embeddings
-        # 每个batch在collate_fn中调用encode_complete_embeddings()
-        # 这样既节省内存，又确保使用最新模型
-        pass  # 不需要额外操作
 
         # === 关键修改: 课程学习策略优化 ===
         # 1. 训练集: 每2个epoch增加一次难度 (给模型更多时间收敛)
