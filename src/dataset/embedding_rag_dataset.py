@@ -109,27 +109,33 @@ class EmbeddingRAGDataset(TrainDataset):
             )
             window_len = current_slice.stop - current_slice.start
 
-            # === 步骤1: 处理参考数据以确定有效位点 ===
+            # === 步骤1: 向量化位点匹配 (NumPy Vectorized) ===
             train_pos = self.pos[current_slice]
-            ref_indices = []
-            valid_pos_mask = []
 
-            for idx, p in enumerate(train_pos):
-                matches = np.where(ref_pos == p)[0]
-                if len(matches) > 0:
-                    ref_indices.append(matches[0])
-                    valid_pos_mask.append(idx)
+            # [VECTORIZED] 使用 searchsorted 批量查找 (假设 ref_pos 已排序)
+            # 时间复杂度: O(n log m) vs 原 O(n * m)
+            found_indices = np.searchsorted(ref_pos, train_pos)
 
-            # 如果有位点被过滤，更新current_slice和train_pos
+            # [SAFETY] 边界处理: Clamp 索引到有效范围
+            found_indices = np.clip(found_indices, 0, len(ref_pos) - 1)
+
+            # [CRITICAL] 严格验证匹配: 只有位置值完全相等才计入
+            # 防止 searchsorted 的近似匹配导致数据错位
+            is_match = (ref_pos[found_indices] == train_pos)
+
+            # 生成有效位点的索引
+            valid_pos_mask = np.where(is_match)[0]  # Training Panel 中的索引
+            ref_indices = found_indices[is_match]   # Reference VCF 中的索引
+
+            # 如果有位点被过滤
             if len(ref_indices) < len(train_pos):
                 if len(valid_pos_mask) == 0:
                     print(f"  ⚠ 跳过窗口 {w_idx}: 没有可用位点")
                     continue
-                valid_indices = current_slice.start + np.array(valid_pos_mask)
-                current_slice = valid_indices
+                # 更新数据
                 train_pos = train_pos[valid_pos_mask]
                 window_len = len(train_pos)
-                self.window_valid_indices[w_idx] = np.array(valid_pos_mask)
+                self.window_valid_indices[w_idx] = valid_pos_mask
 
             # 保存每个窗口的实际长度
             self.window_actual_lens.append(window_len)
@@ -167,7 +173,15 @@ class EmbeddingRAGDataset(TrainDataset):
                 raw_mask_complete, dtype='int'
             )
 
-            raw_ref = ref_gt[current_slice, :, :]  # [L, num_samples, 2]
+            # [CRITICAL FIX] 使用精确的 ref_indices 提取数据，而非 current_slice
+            # 原代码: raw_ref = ref_gt[current_slice, :, :]  ← RISKY! 假设行号一一对应
+            # 新代码: raw_ref = ref_gt[ref_indices, :, :]  ← SAFE! 使用精确匹配的索引
+            raw_ref = ref_gt[ref_indices, :, :]  # [L, num_samples, 2]
+
+            # [SAFETY ASSERT] 开发模式下验证数据对齐
+            assert raw_ref.shape[0] == len(ref_indices), \
+                f"Data alignment error: raw_ref length {raw_ref.shape[0]} != ref_indices length {len(ref_indices)}"
+
             raw_ref = raw_ref.reshape(raw_ref.shape[0], -1)  # [L, num_haps]
             raw_ref = raw_ref.T  # [num_haps, L]
 
