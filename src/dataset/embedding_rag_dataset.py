@@ -506,20 +506,42 @@ class EmbeddingRAGDataset(TrainDataset):
                 if key in output and len(output[key]) > len(valid_mask):
                     output[key] = output[key][valid_mask]
 
-        # 根据配置选择静态或动态mask
-        if self.use_dynamic_mask:
-            # 使用过滤后的实际长度
-            window_len = self.window_actual_lens[window_idx]
+        # [CRITICAL FIX] 实时生成 Mask，解决多进程同步问题
+        # 问题: Worker 进程 fork 后，self.window_masks 仍是旧值
+        # 解决: 根据 current_epoch 实时计算，确保主进程与 Worker 进程逻辑一致
 
-            old_state = np.random.get_state()
-            np.random.seed(self.current_epoch * 10000 + window_idx)
+        # 获取窗口实际长度
+        window_len = self.window_actual_lens[window_idx]
 
-            raw_mask = self.generate_mask(window_len)
-            current_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
+        # 获取 AF 数据
+        af_data = self.ref_af_windows[window_idx][:window_len]
 
-            np.random.set_state(old_state)
+        # 确定随机种子 (与 regenerate_masks 逻辑完全一致)
+        if self.name == 'train':
+            # 训练集: 使用 current_epoch，每个 Epoch 生成新 Mask
+            seed = self.current_epoch
         else:
-            current_mask = self.window_masks[window_idx]
+            # 验证集: 固定种子，确保评估一致性
+            seed = 2024
+
+        # 计算 AF-Guided 概率 (复制 regenerate_masks 的逻辑)
+        rare_af_threshold = 0.05
+        rare_mask_rate = 0.7
+        current_mask_rate = self._TrainDataset__mask_rate[self._TrainDataset__level]
+        probs = np.where(af_data < rare_af_threshold, rare_mask_rate, current_mask_rate)
+
+        # 保存并恢复随机状态 (避免影响其他随机操作)
+        old_state = np.random.get_state()
+        np.random.seed(seed * 10000 + window_idx)
+
+        # 生成 Mask (调用父类方法)
+        raw_mask = super().generate_mask(window_len, probs=probs)
+
+        # 恢复随机状态
+        np.random.set_state(old_state)
+
+        # Padding 到 MAX_SEQ_LEN
+        current_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
 
         output['mask'] = current_mask
         output['hap_1'] = self.tokenize(output['hap1_nomask'], current_mask)
