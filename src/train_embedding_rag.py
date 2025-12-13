@@ -345,48 +345,56 @@ def main():
         print(f"Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*80}")
 
-        # [FIX C] 更新Sampler的随机种子，确保每个epoch的batch顺序不同
-        if hasattr(train_dataloader, 'sampler') and hasattr(train_dataloader.sampler, 'set_epoch'):
-            train_dataloader.sampler.set_epoch(epoch)
-            print(f"✓ Train sampler epoch set to {epoch}")
-
         # 更新epoch计数器
         if rag_train_loader:
             rag_train_loader.current_epoch = epoch
         if rag_val_loader:
             rag_val_loader.current_epoch = epoch
 
-        # === 关键修改1: 每个epoch开始时刷新mask和索引 ===
-        if epoch > 0:  # 第一个epoch使用初始化的mask
+        # === 1. 刷新 Mask (主进程状态更新) ===
+        if epoch > 0:
             print(f"\n{'='*80}")
             print(f"▣ Epoch {epoch}: 刷新Mask和索引 (数据增强)")
             print(f"{'='*80}")
 
-            # 1. 重新生成mask pattern（仅训练集）
             if rag_train_loader:
                 rag_train_loader.regenerate_masks(seed=epoch)
                 print(f"✓ 训练集 Mask 已刷新（数据增强）")
-
-            # [VALIDATION STRATEGY FIX] 验证集 Mask 必须固定，严禁刷新！
-            # 原因：
-            # - 验证集 Mask（题目）变化会导致 Loss 不可比，干扰 Early Stopping
-            # - 验证集应评估"模型在固定任务上的表现"，而非"模型对新任务的泛化"
-            # if rag_val_loader:
-            #     rag_val_loader.regenerate_masks(seed=epoch)  # ← 已禁用！保持题目固定
-            print(f"✓ 验证集 Mask 保持固定（50%），确保评估基准一致")
-
-            # 2. [V18 GPU-JIT] 强制重置JIT缓存，防止 Epoch 间使用旧 Mask 的索引
-            # 索引将在训练时自动 JIT 构建（基于最新 Mask 和 Embedding）
-            if rag_train_loader:
+                
+                # [V18 GPU-JIT] 必须重置缓存，否则会用旧 Mask 的索引
                 rag_train_loader.jit_cache_win_idx = -1
-                print(f"✓ 训练集缓存已重置（将在训练时 JIT 重建）")
+            
+            # 验证集通常不刷新 Mask，保持评估一致性
+            print(f"\n✓ Mask 刷新完成!\n")
 
-            if rag_val_loader:
-                # 验证集索引也需要重置（答案随 Embedding Layer 变化）
-                rag_val_loader.jit_cache_win_idx = -1
-                print(f"✓ 验证集缓存已重置（将在验证时 JIT 重建）")
+        # =========================================================================
+        # [CRITICAL FIX] 重新初始化 DataLoader
+        # 原因：regenerate_masks 修改了 dataset 的内部状态 (self.window_masks)。
+        # 现有的 DataLoader 的 worker 进程是 fork 出来的，持有的是旧状态的副本。
+        # 必须重新创建 DataLoader，迫使 worker 重新 fork，从而获取最新的 Mask。
+        # =========================================================================
+        if rag_train_loader:
+            # 确保 Sampler 这里的 epoch 设置正确
+            if hasattr(train_sampler, 'set_epoch'):
+                train_sampler.set_epoch(epoch)
+            
+            print(f"⚡ Re-initializing DataLoader to sync workers with new Mask...")
+            train_dataloader = DataLoader(
+                rag_train_loader,
+                batch_size=args.train_batch_size,
+                num_workers=args.num_workers,
+                collate_fn=embedding_rag_collate_fn,
+                sampler=train_sampler, # 复用同一个 Sampler 对象
+                pin_memory=True
+            )
+            
+            # [重要] 将新的 DataLoader 更新到 Trainer 实例中
+            trainer.train_dataloader = train_dataloader
+        # =========================================================================
 
-            print(f"\n✓ Mask 刷新和缓存重置完成! (GPU-JIT 模式)\n")
+        # [FIX C] 双重保险：再次设置 Sampler epoch
+        if hasattr(train_dataloader, 'sampler') and hasattr(train_dataloader.sampler, 'set_epoch'):
+            train_dataloader.sampler.set_epoch(epoch)
 
         # 训练
         train_metrics = trainer.train(epoch)
