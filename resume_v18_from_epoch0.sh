@@ -53,12 +53,18 @@ echo ""
 # === Checkpoint恢复配置 ===
 # 请根据实际情况修改以下路径
 RESUME_PATH="/cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag_no_maf/rag_bert.model.ep0"
-RESUME_EPOCH=0  # 从 Epoch 0 的 checkpoint 恢复
+RESUME_EPOCH=1  # ← CRITICAL: 必须设置为 1！
+                # 原因分析:
+                # 1. rag_bert.model.ep0 是第1轮训练（epoch=0, "Epoch 1/20"）结束时保存的
+                # 2. Bug 出现在第2轮训练（epoch=1, "Epoch 2/20"）
+                # 3. 设置 RESUME_EPOCH=1 → range(1, 20) → 从 epoch=1 开始（即重新训练第2轮）
+                # 4. 这样可以验证 Mask 同步修复后，第2轮训练的 F1 是否恢复到 0.92
 
 echo "Resume Parameters:"
 echo "  - Checkpoint: ${RESUME_PATH}"
-echo "  - Resume from Epoch: ${RESUME_EPOCH}"
-echo "  - Start training at: Epoch $((RESUME_EPOCH + 1))"
+echo "  - Resume Epoch Index: ${RESUME_EPOCH}"
+echo "  - Will start training at: Epoch $((RESUME_EPOCH + 1)) (index=${RESUME_EPOCH})"
+echo "  - Explanation: ep0 file = Epoch 1 trained → resume from index 1 = Epoch 2"
 echo ""
 
 # 运行训练
