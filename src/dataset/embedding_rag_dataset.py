@@ -497,10 +497,13 @@ class EmbeddingRAGDataset(TrainDataset):
         # [FIX A] 如果该窗口有位点过滤，先过滤所有序列数据
         if window_idx in self.window_valid_indices:
             valid_mask = self.window_valid_indices[window_idx]
-            # 过滤序列数据（hap1_nomask, hap2_nomask, label）
+            # 过滤序列数据（hap1_nomask, hap2_nomask）
             output['hap1_nomask'] = output['hap1_nomask'][valid_mask]
             output['hap2_nomask'] = output['hap2_nomask'][valid_mask]
-            output['label'] = output['label'][valid_mask]
+            # 过滤label字段
+            output['hap_1_label'] = output['hap_1_label'][valid_mask]
+            output['hap_2_label'] = output['hap_2_label'][valid_mask]
+            output['gt_label'] = output['gt_label'][valid_mask]
             # 过滤 float fields（af, type, pop 等）
             for key in self.float_fields:
                 if key in output and len(output[key]) > len(valid_mask):

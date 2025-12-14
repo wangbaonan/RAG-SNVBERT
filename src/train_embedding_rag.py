@@ -352,20 +352,20 @@ def main():
             rag_val_loader.current_epoch = epoch
 
         # === 1. 刷新 Mask (主进程状态更新) ===
-        if epoch > 0:
-            print(f"\n{'='*80}")
-            print(f"▣ Epoch {epoch}: 刷新Mask和索引 (数据增强)")
-            print(f"{'='*80}")
+        # [FIX] 所有Epoch（包括Epoch 0）都调用regenerate_masks以确保行为一致
+        print(f"\n{'='*80}")
+        print(f"▣ Epoch {epoch}: 刷新Mask和索引 (数据增强)")
+        print(f"{'='*80}")
 
-            if rag_train_loader:
-                rag_train_loader.regenerate_masks(seed=epoch)
-                print(f"✓ 训练集 Mask 已刷新（数据增强）")
-                
-                # [V18 GPU-JIT] 必须重置缓存，否则会用旧 Mask 的索引
-                rag_train_loader.jit_cache_win_idx = -1
-            
-            # 验证集通常不刷新 Mask，保持评估一致性
-            print(f"\n✓ Mask 刷新完成!\n")
+        if rag_train_loader:
+            rag_train_loader.regenerate_masks(seed=epoch)
+            print(f"✓ 训练集 Mask 已刷新（数据增强，seed={epoch}）")
+
+            # [V18 GPU-JIT] 必须重置缓存，否则会用旧 Mask 的索引
+            rag_train_loader.jit_cache_win_idx = -1
+
+        # 验证集通常不刷新 Mask，保持评估一致性
+        print(f"\n✓ Mask 刷新完成!\n")
 
         # =========================================================================
         # [CRITICAL FIX] 重新初始化 DataLoader

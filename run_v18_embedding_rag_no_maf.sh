@@ -20,8 +20,8 @@
 # ==========================================
 
 # 创建日志和数据目录
-LOG_DIR="logs/v18_embedding_rag"
-METRICS_DIR="metrics/v18_embedding_rag"
+LOG_DIR="logs/v18_embedding_rag_1213"
+METRICS_DIR="metrics/v18_embedding_rag_1213"
 mkdir -p ${LOG_DIR}
 mkdir -p ${METRICS_DIR}
 
@@ -81,7 +81,7 @@ echo ""
 #     --resume_epoch ${RESUME_EPOCH} \
 
 # 运行训练
-python -m src.train_embedding_rag \
+python -u -m src.train_embedding_rag \
     --train_dataset /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/data/train_val_split_no_maf/train_split.h5 \
     --train_panel /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_RAG-SNVBERT-packup/data/train_val_split_no_maf/train_panel.txt \
     \
@@ -90,17 +90,17 @@ python -m src.train_embedding_rag \
     \
     --refpanel_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/VCF/Panel/KGP.chr21.Panel.vcf.gz \
     --freq_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/Freq/Freq.npy \
-    --window_size 510 \
+    --window_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/Segments/segments_chr21.csv \
     --type_path data/type_to_idx.bin \
     --pop_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/pop_to_idx.bin \
     --pos_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/pos_to_idx.bin \
     \
-    --output_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag_no_maf/rag_bert.model \
+    --output_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag_no_maf_1213/rag_bert.model \
     \
     --dims 384 \
     --layers 12 \
     --attn_heads 12 \
-    --train_batch_size 72 \
+    --train_batch_size 24 \
     --val_batch_size 48 \
     --epochs 20 \
     --cuda_devices 0 \
