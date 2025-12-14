@@ -41,13 +41,13 @@ class EmbeddingRAGDataset(TrainDataset):
                  build_ref_data=True,
                  n_gpu=1,
                  maf_mask_percentage=10,
-                 use_dynamic_mask=False,
+                 use_same_mask_across_epochs=False,
                  name='default'):
         super().__init__(vocab, vcf, pos, panel, freq, window,
                         type_to_idx, pop_to_idx, pos_to_idx)
 
         self.maf_mask_percentage = maf_mask_percentage
-        self.use_dynamic_mask = use_dynamic_mask
+        self.use_same_mask_across_epochs = use_same_mask_across_epochs
         self.current_epoch = 0
         self.name = name
 
@@ -509,20 +509,9 @@ class EmbeddingRAGDataset(TrainDataset):
                 if key in output and len(output[key]) > len(valid_mask):
                     output[key] = output[key][valid_mask]
 
-        # 根据配置选择静态或动态mask
-        if self.use_dynamic_mask:
-            # 使用过滤后的实际长度
-            window_len = self.window_actual_lens[window_idx]
-
-            old_state = np.random.get_state()
-            np.random.seed(self.current_epoch * 10000 + window_idx)
-
-            raw_mask = self.generate_mask(window_len)
-            current_mask = VCFProcessingModule.sequence_padding(raw_mask, dtype='int')
-
-            np.random.set_state(old_state)
-        else:
-            current_mask = self.window_masks[window_idx]
+        # [EMBEDDING RAG] 使用预生成的静态mask
+        # 关键: Query和Reference必须使用相同的Mask以确保检索语义一致性
+        current_mask = self.window_masks[window_idx]
 
         output['mask'] = current_mask
         output['hap_1'] = self.tokenize(output['hap1_nomask'], current_mask)
@@ -549,7 +538,7 @@ class EmbeddingRAGDataset(TrainDataset):
                   embedding_layer=None,
                   build_ref_data=True,
                   n_gpu=1,
-                  use_dynamic_mask=False,
+                  use_same_mask_across_epochs=False,
                   name='default'):
         """
         从文件创建EmbeddingRAGDataset
@@ -559,6 +548,9 @@ class EmbeddingRAGDataset(TrainDataset):
         Args:
             name: 数据集名称 (用于区分训练集/验证集的索引目录)
                   训练集应使用 'train', 验证集应使用 'val'
+            use_same_mask_across_epochs: 是否跨Epoch使用相同Mask
+                  False (默认): 每个Epoch使用不同Mask (数据增强)
+                  True: 所有Epoch使用相同Mask (稳定训练)
         """
         # 调用父类创建基础dataset
         base_dataset = TrainDataset.from_file(
@@ -581,7 +573,7 @@ class EmbeddingRAGDataset(TrainDataset):
             embedding_layer=embedding_layer,
             build_ref_data=build_ref_data,
             n_gpu=n_gpu,
-            use_dynamic_mask=use_dynamic_mask,
+            use_same_mask_across_epochs=use_same_mask_across_epochs,
             name=name  # 传递name参数
         )
         return rag_dataset

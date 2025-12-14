@@ -64,6 +64,9 @@ def main():
 
     # RAG参数
     parser.add_argument("--rag_k", type=int, default=1, help="RAG检索K值")
+    parser.add_argument("--use_same_mask_across_epochs", type=str, default="false",
+                       choices=["true", "false"],
+                       help="是否跨Epoch使用相同Mask (true=稳定训练, false=数据增强)")
 
     # GPU参数
     parser.add_argument("--cuda_devices", type=int, default=0, help="GPU设备")
@@ -85,6 +88,7 @@ def main():
 
     # 转换boolean参数
     use_recon_loss = (args.use_recon_loss.lower() == "true")
+    use_same_mask_across_epochs = (args.use_same_mask_across_epochs.lower() == "true")
 
     print(f"\n{'='*80}")
     print(f"Embedding RAG Training Configuration")
@@ -209,8 +213,8 @@ def main():
         embedding_layer=embedding_layer,  # 传入embedding layer
         build_ref_data=True,
         n_gpu=1,
-        use_dynamic_mask=False,  # 关键修复: 必须False，确保Query Mask与索引Mask一致
-        name='train'  # 关键修复: 指定训练集名称，避免与验证集索引冲突
+        use_same_mask_across_epochs=use_same_mask_across_epochs,
+        name='train'  # 关键: 指定训练集名称，避免与验证集索引冲突
     )
 
     # === 性能优化: 使用Window-Grouped Sampler (减少磁盘I/O) ===
@@ -251,8 +255,8 @@ def main():
             embedding_layer=embedding_layer,
             build_ref_data=True,
             n_gpu=1,
-            use_dynamic_mask=False,  # 关键修复: 必须False，确保Query Mask与索引Mask一致
-            name='val'  # 关键修复: 指定验证集名称，使用独立的索引目录
+            use_same_mask_across_epochs=use_same_mask_across_epochs,
+            name='val'  # 关键: 指定验证集名称，使用独立的索引目录
         )
 
         # === 性能优化: 验证集也使用Window-Grouped Sampler ===
@@ -354,12 +358,20 @@ def main():
         # === 1. 刷新 Mask (主进程状态更新) ===
         # [FIX] 所有Epoch（包括Epoch 0）都调用regenerate_masks以确保行为一致
         print(f"\n{'='*80}")
-        print(f"▣ Epoch {epoch}: 刷新Mask和索引 (数据增强)")
-        print(f"{'='*80}")
 
         if rag_train_loader:
-            rag_train_loader.regenerate_masks(seed=epoch)
-            print(f"✓ 训练集 Mask 已刷新（数据增强，seed={epoch}）")
+            if rag_train_loader.use_same_mask_across_epochs:
+                # 跨Epoch使用相同Mask (稳定训练)
+                print(f"▣ Epoch {epoch}: 使用相同Mask (所有Epoch seed=0)")
+                print(f"{'='*80}")
+                rag_train_loader.regenerate_masks(seed=0)
+                print(f"✓ 训练集 Mask 已刷新（固定模式，seed=0）")
+            else:
+                # 每个Epoch使用不同Mask (数据增强)
+                print(f"▣ Epoch {epoch}: 刷新Mask (数据增强)")
+                print(f"{'='*80}")
+                rag_train_loader.regenerate_masks(seed=epoch)
+                print(f"✓ 训练集 Mask 已刷新（数据增强，seed={epoch}）")
 
             # [V18 GPU-JIT] 必须重置缓存，否则会用旧 Mask 的索引
             rag_train_loader.jit_cache_win_idx = -1

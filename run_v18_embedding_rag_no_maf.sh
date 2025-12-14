@@ -112,6 +112,8 @@ python -u -m src.train_embedding_rag \
     --lr 7.5e-5 \
     --warmup_steps 15000 \
     \
+    --use_same_mask_across_epochs false \
+    \
     --focal_gamma 2.0 \
     --use_recon_loss false \
     \
