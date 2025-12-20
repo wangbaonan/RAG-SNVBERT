@@ -188,8 +188,10 @@ class BERTWithEmbeddingRAG(BERT):
             hap_2_emb = self.emb_fusion(hap_2_emb_raw, x['pos'], x['af'])
 
             # Retrieved也需要做emb_fusion，确保特征空间一致
-            rag_h1_emb = self.emb_fusion(rag_h1_emb_raw, x['pos'], x['af'])
-            rag_h2_emb = self.emb_fusion(rag_h2_emb_raw, x['pos'], x['af'])
+            #rag_h1_emb = self.emb_fusion(rag_h1_emb_raw, x['pos'], x['af'])
+            #rag_h2_emb = self.emb_fusion(rag_h2_emb_raw, x['pos'], x['af'])
+            rag_h1_emb = rag_h1_emb_raw
+            rag_h2_emb = rag_h2_emb_raw
 
             # 4. 融合query和RAG embeddings (现在在相同特征空间)
             hap_1_fused = self.rag_fusion(

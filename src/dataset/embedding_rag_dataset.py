@@ -330,50 +330,67 @@ class EmbeddingRAGDataset(TrainDataset):
 
         # 3. 处理每个窗口（JIT GPU Indexing）
         for win_idx, indices in window_groups.items():
-            # === JIT构建GPU索引 (如果窗口变化) ===
-            if self.jit_cache_win_idx != win_idx:
-                # 清空旧缓存
-                self.jit_cache_win_idx = -1
-                self.jit_ref_emb_search = None
-                self.jit_ref_tokens_raw = None
-                self.jit_ref_af_raw = None
+            # =================================================================
+            # [关键修改] 强制刷新逻辑 - 解决 End-to-End 训练中的 Embedding 漂移
+            # =================================================================
+            
+            # 1. 检查模型当前是否处于训练模式
+            is_training = embedding_layer.training
 
-                # 从CPU加载当前窗口的Complete Reference Tokens和AF
-                ref_tokens_complete = self.ref_tokens_complete[win_idx]  # [num_haps, L] numpy
-                ref_af = self.ref_af_windows[win_idx]  # [L] numpy
-                current_mask = self.window_masks[win_idx]  # [L] numpy
+            # 2. 决定是否刷新索引
+            # - 如果窗口切换了 (jit_cache_win_idx != win_idx): 必须刷新 (数据变了)
+            # - 如果正在训练 (is_training): 必须刷新 (权重变了，必须用最新权重重新计算 Ref，否则梯度不对齐)
+            should_refresh = (self.jit_cache_win_idx != win_idx) or is_training
 
-                # 上传到GPU
-                ref_tokens_gpu = torch.LongTensor(ref_tokens_complete).to(device)
-                ref_af_gpu = torch.FloatTensor(ref_af).to(device)
-                mask_gpu = torch.LongTensor(current_mask).to(device)
+            if should_refresh:
+                # 判断是"切换窗口"还是仅仅"同窗口刷新权重"
+                is_new_window = (self.jit_cache_win_idx != win_idx)
+                
+                # 只有当确实切换了新窗口，或者缓存为空时，才需要从CPU加载原始数据
+                # 否则(仅仅是训练刷新)，直接复用显存里的 raw tensor，节省 CPU->GPU 带宽
+                if is_new_window or self.jit_ref_tokens_raw is None:
+                    # === 耗时操作: CPU -> GPU 传输 ===
+                    
+                    # 清空旧缓存
+                    self.jit_cache_win_idx = -1
+                    self.jit_ref_emb_search = None
+                    
+                    # 从CPU加载
+                    ref_tokens_complete = self.ref_tokens_complete[win_idx]
+                    ref_af = self.ref_af_windows[win_idx]
+                    current_mask = self.window_masks[win_idx]
 
-                # 应用Mask生成Masked Reference Tokens (在GPU上)
-                # Masked tokens用于检索（与Query语义对齐）
-                ref_tokens_masked = self._apply_mask_to_tokens_gpu(ref_tokens_gpu, mask_gpu)
+                    # 上传到GPU (保留在 self.jit_... 中复用)
+                    self.jit_ref_tokens_raw = torch.LongTensor(ref_tokens_complete).to(device)
+                    self.jit_ref_af_raw = torch.FloatTensor(ref_af).to(device)
+                    mask_gpu = torch.LongTensor(current_mask).to(device)
+                    
+                    # 预处理 Masked Tokens
+                    self.jit_ref_tokens_masked = self._apply_mask_to_tokens_gpu(
+                        self.jit_ref_tokens_raw, mask_gpu
+                    )
+                
+                # === 核心操作: 重新计算 Embeddings (每次训练Step都要做) ===
+                
+                # 准备 AF expanded (每次都需要，因为它依赖于 num_haps)
+                num_haps = self.jit_ref_tokens_masked.size(0)
+                ref_af_expanded = self.jit_ref_af_raw.unsqueeze(0).expand(num_haps, -1)
 
-                num_haps = ref_tokens_masked.size(0)
-                ref_af_expanded = ref_af_gpu.unsqueeze(0).expand(num_haps, -1)  # [num_haps, L]
-
-                # **关键**: 使用eval()模式编码，防止Dropout导致索引不稳定
+                # 使用最新权重编码
                 was_training = embedding_layer.training
-                embedding_layer.eval()
-
+                embedding_layer.eval() # 保持 eval 模式避免 dropout 导致索引抖动
+                
                 with torch.no_grad():
-                    # 编码Masked Reference用于检索
                     ref_emb_search = embedding_layer(
-                        ref_tokens_masked,
+                        self.jit_ref_tokens_masked, # 复用显存数据
                         af=ref_af_expanded,
                         pos=True
-                    )  # [num_haps, L, D]
+                    )
 
-                # 恢复训练状态
                 embedding_layer.train(was_training)
 
-                # 缓存到GPU显存
-                self.jit_ref_emb_search = ref_emb_search  # [num_haps, L, D]
-                self.jit_ref_tokens_raw = ref_tokens_gpu  # Complete tokens [num_haps, L]
-                self.jit_ref_af_raw = ref_af_gpu  # [L]
+                # 更新 Embedding 缓存
+                self.jit_ref_emb_search = ref_emb_search
                 self.jit_cache_win_idx = win_idx
 
             # 获取当前窗口的样本

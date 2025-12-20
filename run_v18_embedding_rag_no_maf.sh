@@ -20,8 +20,8 @@
 # ==========================================
 
 # 创建日志和数据目录
-LOG_DIR="logs/v18_embedding_rag_1213"
-METRICS_DIR="metrics/v18_embedding_rag_1213"
+LOG_DIR="logs/v18_embedding_rag_1217"
+METRICS_DIR="metrics/v18_embedding_rag_1217"
 mkdir -p ${LOG_DIR}
 mkdir -p ${METRICS_DIR}
 
@@ -95,7 +95,7 @@ python -u -m src.train_embedding_rag \
     --pop_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/pop_to_idx.bin \
     --pos_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/pos_to_idx.bin \
     \
-    --output_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag_no_maf_1213/rag_bert.model \
+    --output_path /cpfs01/projects-HDD/humPOG_HDD/wbn_24110700074/RAG_Version/VCF-Bert/00_Data_20250320/41_RAG-SNVBert_Data/output_v18_embrag_no_maf_1217/rag_bert.model \
     \
     --dims 384 \
     --layers 12 \
@@ -105,6 +105,7 @@ python -u -m src.train_embedding_rag \
     --epochs 20 \
     --cuda_devices 0 \
     --log_freq 500 \
+    --num_workers 0 \
     \
     --rag_k 1 \
     --grad_accum_steps 2 \
@@ -112,7 +113,7 @@ python -u -m src.train_embedding_rag \
     --lr 7.5e-5 \
     --warmup_steps 15000 \
     \
-    --use_same_mask_across_epochs false \
+    --use_same_mask_across_epochs true \
     \
     --focal_gamma 2.0 \
     --use_recon_loss false \
